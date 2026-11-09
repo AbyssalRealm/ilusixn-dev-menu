@@ -1126,64 +1126,349 @@ do
     local p = pages.path
 
     -- preview: the path seen from above (north up), numbered points, you as a yellow dot
-    local card = Card(p)
-    card:SetPoint("TOPLEFT", 16, -420); card:SetPoint("BOTTOMRIGHT", -16, 12)
-    local ttl = Text(card, 10, C.dim); ttl:SetPoint("TOPLEFT", 8, -6); ttl:SetText("Path preview (seen from above, north up)")
+    -- the map lives in its own square window (opens with the Path editor, movable, remembers where you put it)
+    local win = CreateFrame("Frame", "CoADevPathMap", UIParent)
+    win:SetSize(580, 800); win:SetFrameStrata("DIALOG"); win:SetToplevel(true); win:SetClampedToScreen(true)
+    win:SetMovable(true); win:EnableMouse(true); win:RegisterForDrag("LeftButton")
+    win:SetScript("OnDragStart", win.StartMoving)
+    win:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local x, y = self:GetLeft(), self:GetTop()
+        IlusixnDevMenuDB.mapPos = { x, y }
+    end)
+    Skin(win, C.bg or C.panel, C.accentD)
+    win:SetResizable(true); win:SetMinResize(580, 600)
+    local grip = CreateFrame("Button", nil, win)
+    grip:SetSize(16, 16); grip:SetPoint("BOTTOMRIGHT", -2, 2)
+    grip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    grip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+    grip:SetScript("OnMouseDown", function() win:StartSizing("BOTTOMRIGHT") end)
+    grip:SetScript("OnMouseUp", function()
+        win:StopMovingOrSizing()
+        IlusixnDevMenuDB.mapPos = { win:GetLeft(), win:GetTop() }
+        IlusixnDevMenuDB.mapSize = { win:GetWidth(), win:GetHeight() }
+    end)
+    win:Hide()
+    local wt = Header(win, "Path map"); wt:SetPoint("TOPLEFT", 12, -10)
+    local wx = Button(win, "X", 22, 22, nil, function() win:Hide() end); wx:SetPoint("TOPRIGHT", -8, -8)
+    local function PlaceMap()
+        win:ClearAllPoints()
+        local sz = IlusixnDevMenuDB.mapSize
+        if sz then win:SetSize(math.max(580, sz[1]), math.max(600, sz[2])) end
+        local pos = IlusixnDevMenuDB.mapPos
+        if pos then win:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", pos[1], pos[2])
+        else win:SetPoint("TOPLEFT", CoADevMenuFrame, "TOPRIGHT", 8, 0) end
+    end
+    local open = Button(p, "Open path map", 160, 28, nil, function() if win:IsShown() then win:Hide() else PlaceMap(); win:Show() end end)
+    open:SetPoint("TOPLEFT", 16, -420)
+    local card = Card(win)
+    card:SetPoint("TOPLEFT", 8, -36); card:SetPoint("BOTTOMRIGHT", -8, 204)
+    local ttl = Text(card, 10, C.dim); ttl:SetPoint("TOPLEFT", 8, -8); ttl:SetText("Path preview")
     local canvas = CreateFrame("Frame", nil, card)
-    canvas:SetPoint("TOPLEFT", 12, -20); canvas:SetPoint("BOTTOMRIGHT", -12, 10)
-    local dots, labels, used, lused = {}, {}, 0, 0
-    local function Dot(x, y, size, col)
-        used = used + 1
-        local d = dots[used]
-        if not d then d = canvas:CreateTexture(nil, "ARTWORK"); d:SetTexture(WHITE); dots[used] = d end
-        d:SetSize(size, size); d:SetVertexColor(unpack(col)); d:ClearAllPoints(); d:SetPoint("CENTER", canvas, "BOTTOMLEFT", x, y); d:Show()
+    canvas:SetPoint("TOPLEFT", 12, -32); canvas:SetPoint("BOTTOMRIGHT", -12, 10)
+    -- view: wheel zooms at the cursor, drag pans, click picks a point
+    local zoom, panX, panY, sel = 1, 0, 0, nil
+    local view = {}   -- set by Draw: sc, cx, cy, CW, CH
+    local bg = canvas:CreateTexture(nil, "BACKGROUND"); bg:SetAllPoints(); bg:SetTexture(WHITE); bg:SetVertexColor(0.035, 0.045, 0.06, 1)
+    -- pooled textures / labels, one pool per layer so lines stay under points
+    local pools = {}
+    local function Pool(layer, size, col)
+        local P = pools[layer]
+        if not P then P = { n = 0 }; pools[layer] = P end
+        P.n = P.n + 1
+        local d = P[P.n]
+        if not d then d = canvas:CreateTexture(nil, layer); d:SetTexture(WHITE); P[P.n] = d end
+        d:SetVertexColor(unpack(col)); d:ClearAllPoints(); d:Show()
         return d
     end
-    local function Label(x, y, txt)
+    -- 3.3.5 frames don't clip their textures: skip what falls outside the map
+    local function Inside(x, y, m) m = m or 0; return x >= -m and y >= -m and x <= canvas:GetWidth() + m and y <= canvas:GetHeight() + m end
+    local function Dot(layer, x, y, size, col)
+        if not Inside(x, y) then return end
+        local d = Pool(layer, size, col); d:SetSize(size, size); d:SetPoint("CENTER", canvas, "BOTTOMLEFT", x, y); return d
+    end
+    local function Rect(x1, y1, x2, y2, col) -- grid line (axis-aligned)
+        x1, x2 = math.max(0, x1), math.min(canvas:GetWidth(), x2); y1, y2 = math.max(0, y1), math.min(canvas:GetHeight(), y2)
+        if x2 <= x1 or y2 <= y1 then return end
+        local d = Pool("BORDER", 1, col); d:SetPoint("BOTTOMLEFT", canvas, "BOTTOMLEFT", x1, y1); d:SetPoint("TOPRIGHT", canvas, "BOTTOMLEFT", x2, y2); return d
+    end
+    local labels, lused = {}, 0
+    local function Label(x, y, txt, col, size, anchor)
+        if not Inside(x, y, -2) then return end
         lused = lused + 1
         local t = labels[lused]
-        if not t then t = Text(canvas, 11, C.text, "OUTLINE"); labels[lused] = t end
-        t:ClearAllPoints(); t:SetPoint("BOTTOM", canvas, "BOTTOMLEFT", x, y + 6); t:SetText(txt); t:Show()
+        if not t then t = Text(canvas, 10, C.text, "OUTLINE"); labels[lused] = t end
+        t:SetFont(FONT, size or 10, "OUTLINE"); t:SetTextColor(unpack(col or C.text))
+        t:ClearAllPoints(); t:SetPoint(anchor or "BOTTOM", canvas, "BOTTOMLEFT", x, y); t:SetText(txt); t:Show()
     end
     local pts, me = {}, nil
-    local RED = { 0.95, 0.25, 0.25, 1 }
+    local LINE, GRID, GRID2 = { 0.95, 0.72, 0.25, 0.9 }, { 1, 1, 1, 0.05 }, { 1, 1, 1, 0.1 }
+    local START, END, MID = { 0.3, 0.85, 0.4, 1 }, { 0.95, 0.3, 0.3, 1 }, { 0.9, 0.92, 0.95, 1 }
     local function Draw()
-        for i = 1, used do dots[i]:Hide() end
+        for _, P in pairs(pools) do for i = 1, P.n do P[i]:Hide() end; P.n = 0 end
         for i = 1, lused do labels[i]:Hide() end
-        used, lused = 0, 0
+        lused = 0
+        local CW, CH = canvas:GetWidth(), canvas:GetHeight()
+        if CW < 40 or CH < 40 then return end
         local all = {}
         for _, q in ipairs(pts) do all[#all + 1] = q end
         if me then all[#all + 1] = me end
-        if #all == 0 then return end
+        if #all == 0 then
+            Label(CW / 2, CH / 2, "No path yet: add points, or press Show path", C.dim, 11, "CENTER")
+            return
+        end
         local minX, maxX, minY, maxY = math.huge, -math.huge, math.huge, -math.huge
         for _, q in ipairs(all) do
             minX = math.min(minX, q[1]); maxX = math.max(maxX, q[1]); minY = math.min(minY, q[2]); maxY = math.max(maxY, q[2])
         end
-        local W, Hh = canvas:GetWidth() - 24, canvas:GetHeight() - 24
-        local span = math.max(maxX - minX, maxY - minY, 10)
+        local pad = 22
+        local W, Hh = CW - pad * 2, CH - pad * 2
+        local span = math.max(maxX - minX, maxY - minY, 10) * 1.08
         local sc = math.min(W, Hh) / span
-        local cx, cy = (minX + maxX) / 2, (minY + maxY) / 2
+        sc = sc * zoom
+        local cx, cy = (minX + maxX) / 2 + panX, (minY + maxY) / 2 + panY
+        view.sc, view.cx, view.cy, view.CW, view.CH = sc, cx, cy, CW, CH
         -- world +X is north (screen up), world +Y is west (screen left)
-        local function S2(q) return W / 2 + 12 - (q[2] - cy) * sc, Hh / 2 + 12 + (q[1] - cx) * sc end
-        for i = 2, #pts do
-            local x1, y1 = S2(pts[i - 1]); local x2, y2 = S2(pts[i])
-            local len = math.sqrt((x2 - x1) ^ 2 + (y2 - y1) ^ 2)
-            for k = 0, len, 2 do Dot(x1 + (x2 - x1) * k / len, y1 + (y2 - y1) * k / len, 3, RED) end
+        local function S2(q) return CW / 2 - (q[2] - cy) * sc, CH / 2 + (q[1] - cx) * sc end
+        -- grid: a round step giving ~6-10 cells, every 5th line brighter
+        local step = 1
+        for _, s in ipairs({ 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000 }) do step = s; if span / zoom / s <= 10 then break end end
+        local px = step * sc
+        local ox, oy = CW / 2 - (math.floor(cy / step) * step - cy) * sc, CH / 2 + (math.floor(cx / step) * step - cx) * sc
+        for k = -60, 60 do
+            local x = ox + k * px
+            if x >= 0 and x <= CW then Rect(x, 0, x + 1, CH, k % 5 == 0 and GRID2 or GRID) end
+            local y = oy + k * px
+            if y >= 0 and y <= CH then Rect(0, y, CW, y + 1, k % 5 == 0 and GRID2 or GRID) end
         end
+        -- scale bar + compass
+        Rect(10, 10, 10 + px, 12, MID); Rect(10, 6, 11, 16, MID); Rect(9 + px, 6, 10 + px, 16, MID)
+        Label(10 + px / 2, 16, step .. " yd", C.dim, 10)
+        Label(CW - 14, CH - 8, "N", C.accent, 12, "TOP"); Dot("ARTWORK", CW - 14, CH - 26, 2, C.accent); Dot("ARTWORK", CW - 14, CH - 30, 2, C.accent)
+        -- route: continuous line, closing segment dimmed when it loops
+        local function Seg(a, b, col)
+            local x1, y1 = S2(a); local x2, y2 = S2(b)
+            local len = math.sqrt((x2 - x1) ^ 2 + (y2 - y1) ^ 2)
+            if len < 1 then return end
+            local n = math.min(math.floor(len), 400)
+            for k = 0, n do Dot("BORDER", x1 + (x2 - x1) * k / n, y1 + (y2 - y1) * k / n, 2, col) end
+            -- direction chevron at the middle of longer segments
+            if len > 30 then
+                local mx, my, ux, uy = (x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) / len, (y2 - y1) / len
+                for j = 1, 4 do
+                    Dot("ARTWORK", mx - ux * j * 1.5 + uy * j * 1.5, my - uy * j * 1.5 - ux * j * 1.5, 2, col)
+                    Dot("ARTWORK", mx - ux * j * 1.5 - uy * j * 1.5, my - uy * j * 1.5 + ux * j * 1.5, 2, col)
+                end
+            end
+        end
+        for i = 2, #pts do Seg(pts[i - 1], pts[i], LINE) end
+        if #pts > 2 then Seg(pts[#pts], pts[1], { LINE[1], LINE[2], LINE[3], 0.25 }) end
+        -- points: start / end bigger, numbers thinned out on long recordings
+        local every = math.max(1, math.ceil(#pts / 25))
         for i, q in ipairs(pts) do
             local x, y = S2(q)
-            Dot(x, y, 9, { 1, 1, 1, 1 }); Dot(x, y, 6, RED)
-            Label(x, y, tostring(i))
+            if i == sel then Dot("ARTWORK", x, y, 20, { C.accent[1], C.accent[2], C.accent[3], 0.45 }) end
+            local first, last = i == 1, i == #pts
+            local col = first and START or last and END or MID
+            local sz = (first or last) and 11 or (#pts > 60 and 4 or 7)
+            Dot("ARTWORK", x, y, sz + 2, { 0, 0, 0, 0.9 }); Dot("OVERLAY", x, y, sz, col)
+            if first then Label(x, y + 8, "Start", START, 10)
+            elseif last then Label(x, y + 8, "End (" .. i .. ")", END, 10)
+            elseif i == sel or i % math.max(1, math.floor(every / zoom)) == 0 then Label(x, y + 5, tostring(i), i == sel and C.accent or C.dim, i == sel and 11 or 9) end
         end
-        if me then local x, y = S2(me); Dot(x, y, 8, C.accent) end
-        ttl:SetText(("Path preview: %d points, about %d yards wide (north up, you = yellow)"):format(#pts, math.floor(span + 0.5)))
+        if me then
+            local x, y = S2(me)
+            Dot("ARTWORK", x, y, 14, { C.accent[1], C.accent[2], C.accent[3], 0.25 }); Dot("OVERLAY", x, y, 7, C.accent)
+            Label(x + 9, y, "You", C.accent, 10, "LEFT")
+        end
+        local total = 0
+        for i = 2, #pts do total = total + math.sqrt((pts[i][1] - pts[i - 1][1]) ^ 2 + (pts[i][2] - pts[i - 1][2]) ^ 2) end
+        ttl:SetText(("Path  |cffe6e8ec%d pts|r  %d yd  x%s"):format(#pts, math.floor(total + 0.5), zoom >= 10 and math.floor(zoom) or ("%.1f"):format(zoom)))
     end
+    -- point tools: pick a point (click it on the map or type its number), then act on it.
+    -- The same row sits under the map and on the Path editor page.
+    local edits = {}
+    local function Pick(i)
+        sel = (i and pts[i]) and i or nil
+        for _, e in ipairs(edits) do e:SetText(sel and tostring(sel) or "") end
+        Draw()
+    end
+    local function Need()
+        local n = sel
+        if not n or not pts[n] then Toast("Pick a point: click it on the map or type its number", "err") return nil end
+        return n
+    end
+    local function Tools(parent, anchor, x, y)
+        local pl = Text(parent, 10, C.dim); pl:SetPoint(anchor, x, y - 4); pl:SetText("Point")
+        local pe = Edit(parent, 40, 20, true); pe:SetPoint("LEFT", pl, "RIGHT", 6, 0)
+        pe:SetScript("OnEnterPressed", function(self) self:ClearFocus(); Pick(tonumber(self:GetText())) end)
+        edits[#edits + 1] = pe
+        local prev = pe
+        for _, b in ipairs({ { "Go to", 56, function(n) local q = pts[n]; Send("PPT", "go", n, q[1], q[2], q[3] or 0) end, "Teleports you to that point." },
+            { "Move here", 80, function(n) Send("PPT", "set", n) end, "Moves that point to where you stand. Edit path first, then Save path." },
+            { "Insert after", 86, function(n) Send("PPT", "ins", n) end, "Adds a point where you stand, right after it." },
+            { "Delete", 60, function(n) Send("PPT", "del", n); Pick(nil) end, "Removes that point from the recording." } }) do
+            local bt = Button(parent, b[1], b[2], 22, nil, function() local n = Need(); if n then b[3](n) end end)
+            bt:SetPoint("LEFT", prev, "RIGHT", 10, 0); prev = bt
+            Tip(bt, b[1], b[4])
+        end
+    end
+    Tools(win, "BOTTOMLEFT", 14, 176)
+    local fit = Button(card, "Fit", 40, 20, nil, function() zoom, panX, panY = 1, 0, 0; Draw() end)
+    fit:SetPoint("TOPRIGHT", -8, -5)
+    Tip(fit, "Zoom", "Mouse wheel on the map zooms at the cursor, drag to move it, click a point to pick it. Fit shows the whole path.")
+    canvas:EnableMouse(true); canvas:EnableMouseWheel(true)
+    local function World(mx, my)   -- screen spot on the canvas -> world x (north), y (west)
+        local s = canvas:GetEffectiveScale()
+        local x, y = mx / s - canvas:GetLeft(), my / s - canvas:GetBottom()
+        return view.cx + (y - view.CH / 2) / view.sc, view.cy - (x - view.CW / 2) / view.sc, x, y
+    end
+    canvas:SetScript("OnMouseWheel", function(_, d)
+        if not view.sc then return end
+        local wx, wy = World(GetCursorPosition())
+        local nz = math.max(1, math.min(60, zoom * (d > 0 and 1.4 or 1 / 1.4)))
+        local k = zoom / nz
+        -- keep the spot under the cursor in place
+        panX = panX + (wx - view.cx) * (1 - k); panY = panY + (wy - view.cy) * (1 - k)
+        if nz == 1 then panX, panY = 0, 0 end
+        zoom = nz; Draw()
+    end)
+    local drag
+    canvas:SetScript("OnMouseDown", function() local mx, my = GetCursorPosition(); drag = { mx, my, panX, panY, false } end)
+    canvas:SetScript("OnMouseUp", function()
+        if drag and not drag[5] and view.sc then
+            local _, _, x, y = World(GetCursorPosition())
+            local best, bd = nil, 14
+            for i, q in ipairs(pts) do
+                local px, py = view.CW / 2 - (q[2] - view.cy) * view.sc, view.CH / 2 + (q[1] - view.cx) * view.sc
+                local d = math.sqrt((px - x) ^ 2 + (py - y) ^ 2)
+                if d < bd then best, bd = i, d end
+            end
+            Pick(best)
+        end
+        drag = nil
+    end)
+    canvas:SetScript("OnUpdate", function()
+        if not drag or not view.sc then return end
+        local mx, my = GetCursorPosition()
+        local s = canvas:GetEffectiveScale()
+        local dx, dy = (mx - drag[1]) / s, (my - drag[2]) / s
+        if math.abs(dx) + math.abs(dy) > 3 then drag[5] = true end
+        if drag[5] then panY = drag[4] + dx / view.sc; panX = drag[3] - dy / view.sc; Draw() end
+    end)
     H.PLB = function() pts = {} end
-    H.PL = function(a) table.insert(pts, { tonumber(a[3]) or 0, tonumber(a[4]) or 0 }) end
+    H.PL = function(a) table.insert(pts, { tonumber(a[3]) or 0, tonumber(a[4]) or 0, tonumber(a[5]) or 0 }) end
     H.PLE = function(a) me = { tonumber(a[2]) or 0, tonumber(a[3]) or 0 }; Draw() end
     card:SetScript("OnSizeChanged", Draw)
+
+    -- Saved paths: keep the route in the preview (recording or a shown path) under a name, load it back as the recording
+    local function Lib() IlusixnDevMenuDB.paths = IlusixnDevMenuDB.paths or {}; return IlusixnDevMenuDB.paths end
+    local sh = Header(p, "Saved paths"); sh:SetPoint("TOPLEFT", 528, -196)
+    local ne = Edit(p, 116, 24); ne:SetPoint("TOPLEFT", 528, -220)
+    local rows, page, Fill = {}, 0, nil
+    local sv = Button(p, "Save", 70, 24, "accent", function() SaveCurrent(ne) end)
+    sv:SetPoint("LEFT", ne, "RIGHT", 6, 0)
+    local function LoadSaved(e)
+        if not e then return end
+        Send("PCLEAR")
+        for _, q in ipairs(e.pts) do Send("PADDAT", q[1], q[2], q[3] - 0.1) end
+        Toast(("Loaded \"%s\": %d points. Select the NPC and Save path."):format(e.name, #e.pts), "ok")
+    end
+    local function SaveCurrent(edit)
+        if #pts < 2 then return Toast("Record or show a path first (2+ points)", "err") end
+        local n = edit:GetText(); if n == "" then n = (GetSubZoneText() ~= "" and GetSubZoneText() or GetZoneText()) .. " path" end
+        local copy = {}; for i, q in ipairs(pts) do copy[i] = { q[1], q[2], q[3] } end
+        table.insert(Lib(), 1, { name = n, zone = GetZoneText(), pts = copy })
+        edit:SetText(""); edit:ClearFocus(); page = 0; Fill()
+        Toast(("Saved \"%s\" (%d points)"):format(n, #copy), "ok")
+    end
+    for i = 1, 5 do
+        local r = Button(p, "", 164, 24, nil, function(self) LoadSaved(self.e) end)
+        r:SetPoint("TOPLEFT", 528, -226 - i * 28)
+        Tip(r, "Load path", "Replaces your recording with this path. Then Save path to selected NPC (works for any NPC near it).")
+        local x = Button(p, "X", 26, 24, "danger", function()
+            if rows[i].e then for k, e in ipairs(Lib()) do if e == rows[i].e then table.remove(Lib(), k) break end end; Fill() end
+        end)
+        x:SetPoint("LEFT", r, "RIGHT", 4, 0)
+        rows[i] = r; r.x = x
+    end
+    local prev = Button(p, "<", 26, 22, nil, function() page = math.max(0, page - 1); Fill() end)
+    prev:SetPoint("TOPLEFT", 528, -394)
+    local nxt = Button(p, ">", 26, 22, nil, function() page = page + 1; Fill() end)
+    nxt:SetPoint("LEFT", prev, "RIGHT", 4, 0)
+    local pinfo = Text(p, 10, C.dim); pinfo:SetPoint("LEFT", nxt, "RIGHT", 8, 0)
+    Fill = function()
+        local L = Lib()
+        page = math.min(page, math.max(0, math.ceil(#L / 5) - 1))
+        for i, r in ipairs(rows) do
+            local e = L[page * 5 + i]; r.e = e
+            r.label:SetText(e and ("%s  |cff8a8f9c(%d)|r"):format(e.name, #e.pts) or "")
+            if e then r:Show(); r.x:Show() else r:Hide(); r.x:Hide() end
+        end
+        pinfo:SetText(#L == 0 and "No saved paths yet" or ("Page %d / %d"):format(page + 1, math.max(1, math.ceil(#L / 5))))
+    end
+    -- the Path editor's controls, mirrored under the map
+    local B = p.btn
+    local function Row(y) local f = CreateFrame("Frame", nil, win); f:SetSize(1, 22); f:SetPoint("BOTTOMLEFT", 14, y); return f end
+    local function Chain(row, list)
+        local prev
+        for _, b in ipairs(list) do
+            if prev then b:SetPoint("LEFT", prev, "RIGHT", 10, 0) else b:SetPoint("LEFT", row, "LEFT", 0, 0) end
+            prev = b
+        end
+        return prev
+    end
+    local function Mirror(label, w, src, style) return Button(win, label, w, 22, style, function() src:Click() end) end
+    local r1 = Row(130)
+    local mAdd, mEv = Mirror("Add point here", 112, B.add, "accent"), Mirror("Every step", 86, B.ev, "chip")
+    local mCnt = Text(win, 13, C.text)
+    Chain(r1, { mAdd, Mirror("Undo last", 76, B.undo), Mirror("Clear", 56, B.clr), mEv })
+    mCnt:SetPoint("LEFT", mEv, "RIGHT", 12, 0)
+    local r2 = Row(94)
+    local mLoop, mBf = Mirror("Loop", 56, B.loop, "chip"), Mirror("Back and forth", 104, B.bf, "chip")
+    local mWalk, mRun = Mirror("Walk", 50, B.walk, "chip"), Mirror("Run", 46, B.run, "chip")
+    local wl = Text(win, 10, C.dim); wl:SetText("Wait at ends")
+    local mWait = Edit(win, 36, 20, true)
+    local last = Chain(r2, { mLoop, mBf, mWalk, mRun })
+    wl:SetPoint("LEFT", last, "RIGHT", 16, 0); mWait:SetPoint("LEFT", wl, "RIGHT", 6, 0)
+    mWait:SetScript("OnTextChanged", function(self) if self:HasFocus() then p.de:SetText(self:GetText()) end end)
+    local r3 = Row(58)
+    Chain(r3, { Mirror("Show path", 80, B.show), Mirror("Edit path", 76, B.edit), Mirror("Remove path", 92, B.del, "danger"),
+        Mirror("Save path to selected NPC", 190, B.save, "accent") })
+    local r4 = Row(20)
+    local sl = Text(win, 10, C.dim); sl:SetText("Saved")
+    local mName = Edit(win, 110, 20)
+    local mSave = Button(win, "Save", 50, 22, "accent", function() SaveCurrent(mName) end)
+    local cur = 1
+    local mPick = Button(win, "", 150, 22, nil, function() LoadSaved(Lib()[cur]) end)
+    Tip(mPick, "Load path", "Replaces your recording with this saved path.")
+    local function ShowCur()
+        local L = Lib(); cur = math.max(1, math.min(cur, #L))
+        mPick.label:SetText(L[cur] and ("%s (%d)"):format(L[cur].name, #L[cur].pts) or "none saved")
+    end
+    local mPrev = Button(win, "<", 22, 22, nil, function() cur = cur - 1; ShowCur() end)
+    local mNext = Button(win, ">", 22, 22, nil, function() cur = cur + 1; ShowCur() end)
+    local mDel = Button(win, "X", 22, 22, "danger", function()
+        if Lib()[cur] then table.remove(Lib(), cur); Fill() end
+    end)
+    sl:SetPoint("LEFT", r4, "LEFT", 0, 0); mName:SetPoint("LEFT", sl, "RIGHT", 6, 0)
+    mSave:SetPoint("LEFT", mName, "RIGHT", 8, 0); mPrev:SetPoint("LEFT", mSave, "RIGHT", 16, 0)
+    mPick:SetPoint("LEFT", mPrev, "RIGHT", 6, 0); mNext:SetPoint("LEFT", mPick, "RIGHT", 6, 0); mDel:SetPoint("LEFT", mNext, "RIGHT", 10, 0)
+    local oldFill = Fill
+    Fill = function() oldFill(); ShowCur() end
+    -- keep the mirrored state in step with the page (both can be clicked)
+    local tick = 0
+    win:SetScript("OnUpdate", function(_, e)
+        tick = tick + e
+        if tick < 0.2 then return end
+        tick = 0
+        mEv:SetActive(B.ev.active); mLoop:SetActive(B.loop.active); mBf:SetActive(B.bf.active)
+        mWalk:SetActive(B.walk.active); mRun:SetActive(B.run.active)
+        mCnt:SetText(p.cnt:GetText() or "")
+        if not mWait:HasFocus() and mWait:GetText() ~= p.de:GetText() then mWait:SetText(p.de:GetText()) end
+    end)
     local prevShow = p.OnShowPage
-    function p:OnShowPage() if prevShow then prevShow(self) end; Send("PLIST") end
+    function p:OnShowPage() if prevShow then prevShow(self) end; Fill(); if not win:IsShown() then PlaceMap(); win:Show() end; Send("PLIST") end
 end
 
 -- ================================================================== Replace: turn the selected spawn into another NPC

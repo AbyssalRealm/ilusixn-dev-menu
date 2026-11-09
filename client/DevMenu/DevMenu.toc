@@ -9,4 +9,5 @@ DevMenu_Ext.lua
 DevMenu_CoA.lua
 DevMenu_Create.lua
 DevMenu_Help.lua
+DevMenu_Share.lua
 DevMenu_Combat.lua

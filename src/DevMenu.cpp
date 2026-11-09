@@ -43,6 +43,8 @@
 #include "Opcodes.h"
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <sstream>
 #include <unordered_map>
@@ -950,6 +952,42 @@ namespace
         SendPathList(p, st.path);
     }
 
+    // PPT~op~n : work on point n (1-based) of the recording. op: go / set (move it to me) / ins (insert my spot after it) / del
+    void OpPathPoint(Player* p, std::vector<std::string> const& a)
+    {
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        std::string what = S(a, 2);
+        uint32 n = U(a, 3);
+        if (what == "go" && a.size() > 6)   // a shown (not loaded) path: the client sends the spot
+        {
+            p->NearTeleportTo(F(a, 4), F(a, 5), F(a, 6) + 0.5f, p->GetOrientation());
+            return Ok(p, "At point " + std::to_string(n));
+        }
+        if (n < 1 || n > st.path.size())
+            return Err(p, "No point " + std::to_string(n) + " in the recording (Edit path loads a saved one)");
+        Position& pt = st.path[n - 1];
+        if (what == "go")
+        {
+            p->NearTeleportTo(pt.GetPositionX(), pt.GetPositionY(), pt.GetPositionZ() + 0.5f, p->GetOrientation());
+            return Ok(p, "At point " + std::to_string(n));
+        }
+        if (what == "set")
+            pt = p->GetPosition();
+        else if (what == "ins")
+            st.path.insert(st.path.begin() + n, p->GetPosition());
+        else if (what == "del")
+            st.path.erase(st.path.begin() + (n - 1));
+        else
+            return;
+        ClearMarkers(p, st);
+        for (Position const& q : st.path)
+            AddMarker(p, st, q);
+        Ok(p, what == "set" ? "Point " + std::to_string(n) + " moved here" : what == "ins" ? "Point added after " + std::to_string(n)
+            : "Point " + std::to_string(n) + " removed");
+        Send(p, Join("PC", uint32(st.path.size())));
+        SendPathList(p, st.path);
+    }
+
     void OpPathUndo(Player* p)
     {
         EditState& st = g_state[p->GetGUID().GetCounter()];
@@ -980,25 +1018,37 @@ namespace
         ClearMarkers(p, st);
         if (editable)
             st.path.clear();
-        WaypointPath const* wp = c->GetWaypointPath() ? sWaypointMgr->GetPath(c->GetWaypointPath()) : nullptr;
-        if (!wp || wp->Nodes.empty())
+        // the live path id can be 0 (template addon, spawned copy...): try the spawn addon, the template addon, then our own id
+        std::vector<uint32> ids = { c->GetWaypointPath() };
+        if (CreatureAddon const* ad = sObjectMgr->GetCreatureAddon(c->GetSpawnId())) ids.push_back(ad->path_id);
+        if (CreatureAddon const* ad = sObjectMgr->GetCreatureTemplateAddon(c->GetEntry())) ids.push_back(ad->path_id);
+        ids.push_back(c->GetSpawnId() * 10);
+        std::vector<Position> shown;
+        for (uint32 id : ids)
+        {
+            if (!id || !shown.empty())
+                continue;
+            if (WaypointPath const* wp = sWaypointMgr->GetPath(id))
+                for (WaypointNode const& n : wp->Nodes)
+                    shown.emplace_back(n.X, n.Y, n.Z, 0.f);
+            if (shown.empty())   // written to the DB but not in memory yet
+                if (QueryResult r = WorldDatabase.Query("SELECT position_x, position_y, position_z FROM waypoint_data WHERE id = {} ORDER BY point", id))
+                    do { Field* f = r->Fetch(); shown.emplace_back(f[0].Get<float>(), f[1].Get<float>(), f[2].Get<float>(), 0.f); } while (r->NextRow());
+        }
+        if (shown.empty())
         {
             Send(p, Join("PC", uint32(st.path.size())));
             return Err(p, "This NPC has no path");
         }
-        for (WaypointNode const& n : wp->Nodes)
+        for (Position const& pos : shown)
         {
-            Position pos(n.X, n.Y, n.Z, 0.f);
             AddMarker(p, st, pos);
             if (editable)
                 st.path.push_back(pos);
         }
         Send(p, Join("PC", uint32(st.path.size())));
-        std::vector<Position> shown;
-        for (WaypointNode const& n : wp->Nodes)
-            shown.emplace_back(n.X, n.Y, n.Z, 0.f);
         SendPathList(p, shown);
-        Ok(p, std::to_string(wp->Nodes.size()) + (editable ? " points loaded for editing (markers shown)" : " path points shown"));
+        Ok(p, std::to_string(shown.size()) + (editable ? " points loaded for editing (markers shown)" : " path points shown"));
     }
 
     void OpPathSave(Player* p, Creature* c, std::vector<std::string> const& a)
@@ -1877,6 +1927,8 @@ namespace
     {
         WorldDatabase.DirectExecute("CREATE TABLE IF NOT EXISTS coa_npc_outfit (entry INT UNSIGNED NOT NULL PRIMARY KEY, outfit VARCHAR(255) NOT NULL, "
             "comment VARCHAR(100) NOT NULL DEFAULT '') ENGINE=InnoDB COMMENT='Dev Menu: player-race NPC looks'");
+        WorldDatabase.DirectExecute("CREATE TABLE IF NOT EXISTS coa_devmenu_changes (tbl VARCHAR(64) NOT NULL, cond VARCHAR(255) NOT NULL, "
+            "PRIMARY KEY (tbl, cond)) ENGINE=InnoDB COMMENT='Dev Menu: rows changed since the last clear (for SQL export)'");
         WorldDatabase.DirectExecute("ALTER TABLE coa_npc_outfit MODIFY outfit VARCHAR(600) NOT NULL");
         std::lock_guard<std::mutex> lock(g_outfitLock);
         g_outfits.clear();
@@ -2247,7 +2299,326 @@ namespace
         Send(p, Join("IE", total, page, pages));
     }
 
+    // ================================================================ change log -> shareable SQL
+    // Every write marks the rows it touched (table + WHERE). Export reads those rows as they are NOW and writes
+    // DELETE + INSERT for each, so the file is re-runnable and also carries deletions (row gone = DELETE only).
+    void Mark(std::string const& tbl, std::string const& cond)
+    {
+        WorldDatabase.DirectExecute("INSERT IGNORE INTO coa_devmenu_changes (tbl, cond) VALUES ('{}', '{}')", Esc(tbl), Esc(cond));
+    }
+    std::string Eq(char const* col, uint64 v) { return std::string("`") + col + "` = " + std::to_string(v); }
+
+    uint32 MaxOf(std::string const& sql)
+    {
+        QueryResult r = WorldDatabase.Query(sql);
+        return r && !r->Fetch()[0].IsNull() ? r->Fetch()[0].Get<uint32>() : 0;
+    }
+
+    void MarkType(uint32 entry)
+    {
+        if (!entry)
+            return;
+        Mark("creature_template", Eq("entry", entry));
+        Mark("creature_template_model", Eq("CreatureID", entry));
+        Mark("creature_template_addon", Eq("entry", entry));
+        Mark("creature_equip_template", Eq("CreatureID", entry));
+        Mark("creature_onkill_reputation", Eq("creature_id", entry));
+        Mark("npc_vendor", Eq("entry", entry));
+        Mark("creature_default_trainer", Eq("CreatureId", entry));
+        Mark("creature_queststarter", Eq("id", entry));
+        Mark("creature_questender", Eq("id", entry));
+        Mark("smart_scripts", Eq("entryorguid", entry) + " AND `source_type` = 0");
+        Mark("coa_npc_outfit", Eq("entry", entry));
+        // talk menus and trainers the menu made for this NPC
+        uint32 menu = MaxOf("SELECT gossip_menu_id FROM creature_template WHERE entry = " + std::to_string(entry));
+        if (menu >= 9998001 && menu <= 9998999)
+        {
+            Mark("gossip_menu", Eq("MenuID", menu));
+            Mark("gossip_menu_option", Eq("MenuID", menu));
+            if (QueryResult t = WorldDatabase.Query("SELECT TextID FROM gossip_menu WHERE MenuID = {}", menu))
+                do Mark("npc_text", Eq("ID", t->Fetch()[0].Get<uint32>())); while (t->NextRow());
+        }
+        uint32 tr = MaxOf("SELECT TrainerId FROM creature_default_trainer WHERE CreatureId = " + std::to_string(entry));
+        if (tr >= CLONE_FIRST && tr <= CLONE_LAST)
+        {
+            Mark("trainer", Eq("Id", tr));
+            Mark("trainer_spell", Eq("TrainerId", tr));
+        }
+    }
+
+    void MarkSpawn(uint32 guid)
+    {
+        Mark("creature", Eq("guid", guid));
+        Mark("creature_addon", Eq("guid", guid));
+        Mark("waypoint_data", Eq("id", uint64(guid) * 10));
+        uint32 e = MaxOf("SELECT id FROM creature WHERE guid = " + std::to_string(guid));
+        if (e >= CLONE_FIRST && e <= CLONE_LAST)
+            MarkType(e);
+    }
+
+    void MarkGoType(uint32 e)
+    {
+        Mark("gameobject_template", Eq("entry", e));
+        Mark("gameobject_template_addon", Eq("entry", e));
+    }
+
+    void MarkGo(uint32 guid)
+    {
+        Mark("gameobject", Eq("guid", guid));
+        Mark("gameobject_addon", Eq("guid", guid));
+        uint32 e = MaxOf("SELECT id FROM gameobject WHERE guid = " + std::to_string(guid));
+        if (e >= GOTPL_FIRST && e <= GOTPL_LAST)
+            MarkGoType(e);
+    }
+
+    void MarkQuest(uint32 id)
+    {
+        for (char const* t : { "quest_template", "quest_template_addon", "quest_offer_reward", "quest_request_items" })
+            Mark(t, Eq("ID", id));
+        Mark("creature_queststarter", Eq("quest", id));
+        Mark("creature_questender", Eq("quest", id));
+        Mark("waypoints", Eq("entry", ESCORT_WP_BASE + id));
+    }
+
+    // highest ids before an op, so whatever it created can be marked afterwards
+    struct HighWater { uint32 cr = 0, go = 0, ct = 0, gt = 0, q = 0; };
+    HighWater TakeHighWater()
+    {
+        HighWater h;
+        h.cr = MaxOf("SELECT MAX(guid) FROM creature");
+        h.go = MaxOf("SELECT MAX(guid) FROM gameobject");
+        h.ct = MaxOf("SELECT MAX(entry) FROM creature_template");
+        h.gt = MaxOf("SELECT MAX(entry) FROM gameobject_template");
+        h.q = MaxOf("SELECT MAX(ID) FROM quest_template");
+        return h;
+    }
+    void MarkNewSince(HighWater const& h)
+    {
+        if (QueryResult r = WorldDatabase.Query("SELECT guid FROM creature WHERE guid > {}", h.cr))
+            do MarkSpawn(r->Fetch()[0].Get<uint32>()); while (r->NextRow());
+        if (QueryResult r = WorldDatabase.Query("SELECT guid FROM gameobject WHERE guid > {}", h.go))
+            do MarkGo(r->Fetch()[0].Get<uint32>()); while (r->NextRow());
+        if (QueryResult r = WorldDatabase.Query("SELECT entry FROM creature_template WHERE entry > {}", h.ct))
+            do MarkType(r->Fetch()[0].Get<uint32>()); while (r->NextRow());
+        if (QueryResult r = WorldDatabase.Query("SELECT entry FROM gameobject_template WHERE entry > {}", h.gt))
+            do MarkGoType(r->Fetch()[0].Get<uint32>()); while (r->NextRow());
+        if (QueryResult r = WorldDatabase.Query("SELECT ID FROM quest_template WHERE ID > {}", h.q))
+            do MarkQuest(r->Fetch()[0].Get<uint32>()); while (r->NextRow());
+    }
+
+    void SendChangeCount(Player* p) { Send(p, Join("SQLN", MaxOf("SELECT COUNT(*) FROM coa_devmenu_changes"))); }
+
+    // SQLAREA~radius : every saved NPC and object around you (radius 0 = your whole zone)
+    void OpSqlArea(Player* p, std::vector<std::string> const& a)
+    {
+        float r = F(a, 2);
+        uint32 n = 0;
+        std::string where = r > 0
+            ? Acore::StringFormat("map = {} AND POW(position_x - ({}), 2) + POW(position_y - ({}), 2) <= {}", p->GetMapId(), p->GetPositionX(), p->GetPositionY(), r * r)
+            : Acore::StringFormat("map = {} AND zoneId = {}", p->GetMapId(), p->GetZoneId());
+        if (QueryResult q = WorldDatabase.Query("SELECT guid FROM creature WHERE " + where))
+            do { MarkSpawn(q->Fetch()[0].Get<uint32>()); ++n; } while (q->NextRow());
+        if (QueryResult q = WorldDatabase.Query("SELECT guid FROM gameobject WHERE " + where))
+            do { MarkGo(q->Fetch()[0].Get<uint32>()); ++n; } while (q->NextRow());
+        Ok(p, std::to_string(n) + " NPCs and objects added to the change set");
+        SendChangeCount(p);
+    }
+
+    // SQLALL : everything made with the menu (its id ranges) and every spawn of it
+    void OpSqlAll(Player* p)
+    {
+        if (QueryResult q = WorldDatabase.Query("SELECT guid FROM creature WHERE id BETWEEN {} AND {}", CLONE_FIRST, CLONE_LAST))
+            do MarkSpawn(q->Fetch()[0].Get<uint32>()); while (q->NextRow());
+        if (QueryResult q = WorldDatabase.Query("SELECT entry FROM creature_template WHERE entry BETWEEN {} AND {}", CLONE_FIRST, CLONE_LAST))
+            do MarkType(q->Fetch()[0].Get<uint32>()); while (q->NextRow());
+        if (QueryResult q = WorldDatabase.Query("SELECT guid FROM gameobject WHERE id BETWEEN {} AND {}", GOTPL_FIRST, GOTPL_LAST))
+            do MarkGo(q->Fetch()[0].Get<uint32>()); while (q->NextRow());
+        if (QueryResult q = WorldDatabase.Query("SELECT ID FROM quest_template WHERE ID BETWEEN {} AND {}", QUEST_FIRST, QUEST_LAST))
+            do MarkQuest(q->Fetch()[0].Get<uint32>()); while (q->NextRow());
+        Ok(p, "Everything made with the dev menu added to the change set");
+        SendChangeCount(p);
+    }
+
+    std::string SqlValue(Field const& f)
+    {
+        if (f.IsNull())
+            return "NULL";
+        std::string v = f.Get<std::string>();
+        WorldDatabase.EscapeString(v);
+        return "'" + v + "'";
+    }
+
+    // SQLEXP~name : writes devmenu_sql/<date>_<name>.sql next to worldserver
+    void OpSqlExport(Player* p, std::vector<std::string> const& a)
+    {
+        std::string name;
+        for (char ch : S(a, 2))
+            if (std::isalnum(uint8(ch)) || ch == '-' || ch == '_') name += ch;
+        if (name.empty()) name = "changes";
+        // CoA repository format (jealous-sound pending_db_world lint): no DELETE on the protected template tables
+        // (upsert instead), every other INSERT right after its DELETE, backticked names, module-only tables left out
+        bool coa = S(a, 3) == "coa";
+        static std::set<std::string> const protectedTables = { "creature_template", "gameobject_template", "item_template", "quest_template" };
+        QueryResult list = WorldDatabase.Query("SELECT tbl, cond FROM coa_devmenu_changes ORDER BY tbl, cond");
+        if (!list)
+            return Err(p, "Nothing in the change set yet");
+        std::filesystem::create_directories("devmenu_sql");
+        time_t now = time(nullptr);
+        std::tm lt = *std::localtime(&now);
+        char stamp[32], day[16];
+        strftime(stamp, sizeof(stamp), "%Y_%m_%d_%H%M", &lt);
+        strftime(day, sizeof(day), "%Y%m%d", &lt);
+        std::string path;
+        if (coa)
+        {
+            std::string low = Lower(name);
+            for (char& ch : low) if (ch == '-') ch = '_';
+            for (uint32 n = 0; n < 100 && (path.empty() || std::filesystem::exists(path)); ++n)
+                path = Acore::StringFormat("devmenu_sql/rev_{}_{:02}_{}.sql", day, n, low);
+        }
+        else
+            path = std::string("devmenu_sql/") + stamp + "_" + name + ".sql";
+        std::ofstream out(path, std::ios::binary);
+        if (!out)
+            return Err(p, "Could not write " + path);
+        out << "-- Made with ilusixn Dev Menu (" << stamp << "). World database. Safe to run more than once.\n";
+        if (!coa)
+            out << "CREATE TABLE IF NOT EXISTS `coa_npc_outfit` (`entry` INT UNSIGNED NOT NULL PRIMARY KEY, `outfit` VARCHAR(600) NOT NULL, "
+                   "`comment` VARCHAR(100) NOT NULL DEFAULT '') ENGINE=InnoDB COMMENT='Dev Menu: player-race NPC looks';\n";
+        uint32 rows = 0;
+        std::string skippedLooks, keptTemplates;
+        do
+        {
+            std::string tbl = list->Fetch()[0].Get<std::string>(), cond = list->Fetch()[1].Get<std::string>();
+            if (!MaxOf("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '" + Esc(tbl) + "'"))
+                continue;   // a table this server doesn't have
+            QueryResult r = WorldDatabase.Query("SELECT * FROM `" + tbl + "` WHERE " + cond);
+            if (coa && tbl == "coa_npc_outfit")
+            {
+                if (r)
+                    skippedLooks += (skippedLooks.empty() ? "" : ", ") + cond.substr(cond.find('=') + 2);
+                continue;
+            }
+            bool upsert = coa && protectedTables.count(tbl);
+            if (upsert && !r)
+            {
+                keptTemplates += "\n-- " + tbl + " " + cond + " was deleted on the editing server (protected table: not deleted here)";
+                continue;
+            }
+            if (upsert)
+                out << "\n";
+            else
+                out << "\nDELETE FROM `" << tbl << "` WHERE " << cond << ";\n";
+            if (!r)
+                continue;
+            std::string cols, update;
+            for (uint32 i = 0; i < r->GetFieldCount(); ++i)
+            {
+                std::string c = r->GetFieldName(i);
+                cols += (i ? ", `" : "`") + c + "`";
+                update += (i ? ", `" : "`") + c + "` = VALUES(`" + c + "`)";
+            }
+            out << "INSERT INTO `" << tbl << "` (" << cols << ")\nVALUES\n";
+            bool first = true;
+            do
+            {
+                Field* f = r->Fetch();
+                out << (first ? "(" : ",\n(");
+                for (uint32 i = 0; i < r->GetFieldCount(); ++i)
+                    out << (i ? "," : "") << SqlValue(f[i]);
+                out << ")";
+                first = false;
+                ++rows;
+            } while (r->NextRow());
+            if (upsert)
+                out << "\nON DUPLICATE KEY UPDATE " << update;
+            out << ";\n";
+        } while (list->NextRow());
+        if (!keptTemplates.empty())
+            out << keptTemplates << "\n";
+        if (!skippedLooks.empty())
+            out << "\n-- Dressed NPC looks are not included (module table coa_npc_outfit): " << skippedLooks
+                << "\n-- On a server without the Dev Menu module these NPCs show their race's base model.\n";
+        out.close();
+        std::string full = std::filesystem::absolute(path).string();
+        Ok(p, "Exported " + std::to_string(rows) + " rows");
+        Send(p, Join("SQLF", Clean(full, 220), rows));
+    }
+
+    // ops that only read or only touch your recording: they never mark anything
+    bool IsReadOnly(std::string const& op)
+    {
+        static std::set<std::string> const ro = { "HELLO", "SEARCH", "NEAR", "PPT", "PADD", "PUNDO", "PCLEAR", "PCLICK", "PADDAT", "PLIST", "BUF", "BUFC",
+            "RGET", "RLOAD", "LGET", "NEWID", "QSEARCH", "GSEARCH", "ORACES", "ISEARCH", "DISGUISE", "UNDISGUISE", "OMINE", "OGET", "OPREV",
+            "OPREVDEL", "XCSEARCH", "SPSEARCH", "GNEAR", "GTGT", "GPICK", "GSEL", "GGOTO", "SEL", "TGET", "CGET", "GOTO", "PSHOW", "PEDIT",
+            "RESPAWN", "PLAY", "SQLN", "SQLAREA", "SQLALL", "SQLEXP", "SQLCLR" };
+        return ro.count(op) != 0;
+    }
+
+    // marks what a write op is about to change (rows that will be deleted are marked too)
+    void MarkBefore(std::string const& op, std::vector<std::string> const& a, Creature* c)
+    {
+        if (c)
+        {
+            MarkSpawn(c->GetSpawnId());
+            static std::set<std::string> const typeOps = { "TSET", "CADD", "CDEL", "REP", "ROLE", "GUARD", "FACTION", "RENAME", "LEVEL", "MODEL", "VENDORADD", "ENTRY", "UNIQUE" };
+            if (typeOps.count(op))
+                MarkType(c->GetEntry());
+            return;
+        }
+        if (op == "RSET" && RowTables().count(S(a, 2)))
+            Mark(S(a, 2), Eq(RowTables().at(S(a, 2)).c_str(), U(a, 3)));
+        else if ((op == "LADD" || op == "LDEL") && RowTables().count(S(a, 2)))
+        {
+            std::string kc = RowTables().at(S(a, 2));
+            for (size_t i = 3; i < a.size(); ++i)
+                if (a[i].rfind(kc + "=", 0) == 0)
+                    Mark(S(a, 2), Eq(kc.c_str(), std::strtoull(a[i].c_str() + kc.size() + 1, nullptr, 10)));
+        }
+        else if (op == "RENAMET" || op == "VCUR") MarkType(U(a, 2));
+        else if (op == "QDEL") MarkQuest(U(a, 2));
+        else if (op == "QESCORT") { MarkQuest(U(a, 2)); MarkSpawn(U(a, 3)); MarkType(MaxOf("SELECT id FROM creature WHERE guid = " + std::to_string(U(a, 3)))); }
+        else if (op == "OSAVE" && U(a, 2)) MarkSpawn(U(a, 2));
+        else if (op == "IPRICE" && a.size() > 3 && !a[3].empty()) Mark("item_template", Eq("entry", U(a, 2)));
+        else if (op == "GMOVE" || op == "GNUDGE" || op == "GNUDGEW" || op == "GROT" || op == "GFACE" || op == "GDEL") MarkGo(U(a, 2));
+    }
+
+    void DispatchOp(Player* p, std::string const& payload);
+
+    // every request: SQL change-set ops, then the op itself with change tracking around it
     void Dispatch(Player* p, std::string const& payload)
+    {
+        std::vector<std::string> a = Split(payload, '~');
+        if (a.size() < 2 || a[0] != "Q" || !sConfigMgr->GetOption<bool>("DevMenu.Enable", true)
+            || uint32(p->GetSession()->GetSecurity()) < sConfigMgr->GetOption<uint32>("DevMenu.MinSecurity", SEC_GAMEMASTER))
+            return DispatchOp(p, payload);   // it reports the error
+        std::string const& op = a[1];
+        if (op == "SQLN") return SendChangeCount(p);
+        if (op == "SQLAREA") return OpSqlArea(p, a);
+        if (op == "SQLALL") return OpSqlAll(p);
+        if (op == "SQLEXP") return OpSqlExport(p, a);
+        if (op == "SQLCLR") { WorldDatabase.DirectExecute("DELETE FROM coa_devmenu_changes"); Ok(p, "Change set cleared"); return SendChangeCount(p); }
+        if (IsReadOnly(op))
+            return DispatchOp(p, payload);
+        static std::set<std::string> const globalOps = { "SPAWN", "DUP", "RENAMET", "RSET", "LADD", "LDEL", "QNEW", "QDEL", "QESCORT", "OSAVE",
+            "IPRICE", "VCUR", "GSPAWN", "GMOVE", "GNUDGE", "GNUDGEW", "GROT", "GFACE", "GDEL", "GDUP" };
+        Creature* c = nullptr;
+        if (!globalOps.count(op))
+        {
+            if (U(a, 2)) c = FindSpawn(p, U(a, 2));
+            else if (Unit* u = p->GetSelectedUnit()) c = u->ToCreature();
+            if (c && !c->GetSpawnId()) c = nullptr;
+        }
+        MarkBefore(op, a, c);
+        HighWater hw = TakeHighWater();
+        DispatchOp(p, payload);
+        MarkNewSince(hw);
+        if ((op == "ENTRY" || op == "UNIQUE") && c && c->IsInWorld())
+            MarkType(c->GetEntry());
+        SendChangeCount(p);
+    }
+
+    void DispatchOp(Player* p, std::string const& payload)
     {
         std::vector<std::string> a = Split(payload, '~');
         if (a.size() < 2 || a[0] != "Q")
@@ -2270,6 +2641,7 @@ namespace
         if (op == "PCLEAR") return OpPathClear(p);
         if (op == "PCLICK") return OpPathClickMode(p, a);
         if (op == "PADDAT") return OpPathAddAt(p, a);
+        if (op == "PPT") return OpPathPoint(p, a);
         if (op == "PLIST") return SendPathList(p, g_state[p->GetGUID().GetCounter()].path);
         if (op == "BUF") { g_buf[p->GetGUID().GetCounter()] += S(a, 2); return; }
         if (op == "BUFC") { g_buf[p->GetGUID().GetCounter()].clear(); return; }

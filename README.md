@@ -53,7 +53,11 @@ It's a plain module: no core patches and no SQL to import. It creates its own ta
     - Each spell has a timer, a target (current target, itself or a random enemy) and a chance.
     - Hostile and friendly NPCs both use them.
   - **Advanced:** every stat, flag, respawn time and kill reputation.
-- **Path editor:** walk and press *Add point here* (or `/dev point`). A drawing shows the route from above. Choose loop or back-and-forth, walk or run, and a wait at the ends.
+- **Path editor:** walk and press *Add point here* (or `/dev point`), or turn on *Every step* to drop a point each step while you move. Choose loop or back-and-forth, walk or run, and a wait at the ends.
+  - *Show path* draws an NPC's saved route; *Edit path* loads it as your recording.
+  - **Path map:** its own resizable window. Zoom with the wheel, drag to pan, pick a point and *Go to* (teleport), *Move here*, *Insert after* or *Delete*. Every path button is also under the map.
+  - **Saved paths:** keep routes by name and load them on any NPC later.
+- **Share as SQL:** every change you make is tracked. *Export SQL* writes `devmenu_sql/<date>_<name>.sql` next to worldserver: the rows as they are now (delete + insert, safe to run twice). Anyone runs it on their world database and gets the same NPCs in the same places. *Add area / zone / everything* pulls in older work.
 - **Nearby spawns:** saved spawns around you, nearest first.
 - **Quests:**
   - Create quests given by the selected NPC: text, objectives, rewards, rules and chains, plus who gives and finishes them.
@@ -79,6 +83,17 @@ It's a plain module: no core patches and no SQL to import. It creates its own ta
 
 Dressed NPCs use the same trick as the Mirror Image spell, so every unmodified 3.3.5a client shows them, no client patch needed. Weapons are normal NPC equipment.
 
+### Sharing dressed NPCs without the module: baking
+
+Dressed NPCs need this module on the server that shows them. To share them with servers that don't run it, bake them after *Export SQL*:
+
+```
+pip install pillow
+python tools/bake/bake.py --data "<WoW folder>/Data" --exports "<server>/devmenu_sql" --user <mysql user> --password <mysql password>
+```
+
+It writes `<name>_baked.sql` (run it instead of the plain export, no module needed) and `patch-ZZZZZZ.MPQ` (players put it in their `Data` folder; it replaces the client's `CreatureDisplayInfo` and `CreatureDisplayInfoExtra` DBCs with yours plus the baked models). Skins are painted from the client's own files. Clients that draw faces differently can pass ready textures with `--capture <folder>`. `python tools/bake/bake.py -h` lists every option.
+
 ### Custom clients: look adapters
 
 A stock client has 5 look rows: skin, face, hair style, hair color and facial hair. Custom clients that add more (tattoos, horns, extra palettes…) can plug in a small Lua **look adapter**, and its rows appear in Create an NPC. Clients without one simply ignore the extra values. The in-game Help page explains the API.
@@ -94,6 +109,9 @@ A stock client has 5 look rows: skin, face, hair style, hair color and facial ha
 | Talk menus | 9 998 001 – 9 998 999 |
 | NPC texts | 16 000 001+ |
 | Escort paths | 99 800 000 + quest id |
+| Baked models (bake tool) | after the highest display id in client and server |
+
+Tables it adds to the world database: `coa_npc_outfit`, `coa_devmenu_changes` (the change set), `coa_npc_bake` (baked model ids, so re-baking keeps them).
 
 If your server already uses these ranges, change the constants at the top of `src/DevMenu.cpp`.
 

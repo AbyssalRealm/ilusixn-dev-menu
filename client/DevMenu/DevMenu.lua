@@ -247,6 +247,7 @@ local NAV = {
     { "quests", "Quests", "Interface\\Icons\\INV_Misc_Note_06" },
     { "objects", "Objects & assets", "Interface\\Icons\\INV_Crate_04" },
     { "create", "Create an NPC", "Interface\\Icons\\INV_Misc_Head_Human_01" },
+    { "share", "Share as SQL", "Interface\\Icons\\INV_Scroll_03" },
     { "help", "Help", "Interface\\Icons\\INV_Misc_QuestionMark" },
 }
 for i, n in ipairs(NAV) do
@@ -271,7 +272,7 @@ end
 local navInfo = Text(nav, 10, C.dim)
 navInfo:SetPoint("BOTTOMLEFT", 12, 12)
 navInfo:SetWidth(150)
-navInfo:SetText("Everything you change is saved to the world database right away.")
+navInfo:SetText("Everything you change is saved right away. Share it as SQL from Share as SQL.")
 
 -- size & transparency (saved). Size scales the whole window so the layout never breaks.
 local P_ -- preview frame, set later
@@ -1098,7 +1099,7 @@ do
     local steps = Text(p, 12, C.text)
     steps:SetPoint("TOPLEFT", 16, -44)
     steps:SetWidth(680)
-    steps:SetText("1.  Select the NPC (Selected NPC page).\n2.  Walk to each spot it should pass and press  Add point here  (or type /dev point).\n3.  Choose loop or back-and-forth, then  Save path.  A marker shows each point while you record.")
+    steps:SetText("1.  Select the NPC (Selected NPC page).\n2.  Walk to each spot it should pass and press  Add point here  (or type /dev point), or turn on  Every step  and just walk.\n3.  Choose loop or back-and-forth, then  Save path.  A marker shows each point while you record.")
     local selText = Text(p, 12, C.accent)
     selText:SetPoint("TOPLEFT", 16, -104)
     local add = Button(p, "Add point here", 180, 40, "accent", function() Send("PADD") end)
@@ -1107,8 +1108,23 @@ do
     undo:SetPoint("LEFT", add, "RIGHT", 8, 0)
     local clr = Button(p, "Clear", 90, 40, nil, function() Send("PCLEAR") end)
     clr:SetPoint("LEFT", undo, "RIGHT", 8, 0)
+    -- Every step: while on, drops a point every 0.6 s you are moving (about one per stride at walk speed)
+    local every, since = false, 0
+    local stepF = CreateFrame("Frame")
+    stepF:Hide()
+    stepF:SetScript("OnUpdate", function(_, e)
+        since = since + e
+        if since >= 0.6 and GetUnitSpeed("player") > 0 then since = 0; Send("PADD") end
+    end)
+    local ev
+    ev = Button(p, "Every step", 120, 40, "chip", function()
+        every = not every; since = 0
+        ev:SetActive(every)
+        if every then stepF:Show() else stepF:Hide() end
+    end)
+    ev:SetPoint("LEFT", clr, "RIGHT", 8, 0)
     local cnt = Text(p, 20, C.text)
-    cnt:SetPoint("LEFT", clr, "RIGHT", 20, 0)
+    cnt:SetPoint("LEFT", ev, "RIGHT", 20, 0)
     p.cnt = cnt
 
     local oh = Header(p, "Options")
@@ -1147,13 +1163,18 @@ do
     save:SetPoint("TOPLEFT", 16, -300)
     local eh = Header(p, "Existing path")
     eh:SetPoint("TOPLEFT", 16, -356)
-    local show = Button(p, "Show path", 120, 28, nil, function() if S.selected then Send("PSHOW", S.selected.guid) end end)
+    local function NeedSel(op) if not S.selected then return Toast("Select an NPC first", "err") end; Send(op, S.selected.guid) end
+    local show = Button(p, "Show path", 120, 28, nil, function() NeedSel("PSHOW") end)
     show:SetPoint("TOPLEFT", 16, -380)
-    local edit = Button(p, "Edit path", 120, 28, nil, function() if S.selected then Send("PEDIT", S.selected.guid) end end)
+    local edit = Button(p, "Edit path", 120, 28, nil, function() NeedSel("PEDIT") end)
     edit:SetPoint("LEFT", show, "RIGHT", 8, 0)
     Tip(edit, "Edit path", "Loads the saved points as your recording: undo/add points, then Save path again.")
-    local del = Button(p, "Remove path", 120, 28, "danger", function() if S.selected then Send("PDEL", S.selected.guid) end end)
+    local del = Button(p, "Remove path", 120, 28, "danger", function() NeedSel("PDEL") end)
     del:SetPoint("LEFT", edit, "RIGHT", 8, 0)
+    -- the path map window mirrors these controls (it clicks them and copies their state)
+    p.btn = { add = add, undo = undo, clr = clr, ev = ev, loop = modeChips[1], bf = modeChips[2], walk = runChips[1], run = runChips[2],
+        save = save, show = show, edit = edit, del = del }
+    p.de = de
     function p:OnShowPage()
         selText:SetText(S.selected and ("Selected: " .. S.selected.name .. "  (guid " .. S.selected.guid .. ")") or "No NPC selected")
         cnt:SetText(S.pathCount .. " points")
@@ -1548,8 +1569,8 @@ H.TE = function() if S.RefreshAdvanced then S.RefreshAdvanced() end end
 H.DL = function(a)
     if S.selected and S.selected.guid == a[2] then S.selected = nil; Inspector() end
 end
-H.PP = function(a) S.pathCount = tonumber(a[2]) or 0; pages.path:OnShowPage(); Toast(("Point %d added"):format(S.pathCount), "ok") end
-H.PC = function(a) S.pathCount = tonumber(a[2]) or 0; pages.path:OnShowPage() end
+H.PP = function(a) S.pathCount = tonumber(a[2]) or 0; pages.path.cnt:SetText(S.pathCount .. " points"); Toast(("Point %d added"):format(S.pathCount), "ok") end
+H.PC = function(a) S.pathCount = tonumber(a[2]) or 0; pages.path.cnt:SetText(S.pathCount .. " points") end
 
 CoADev = {
     C = C, WHITE = WHITE, FONT = FONT, Shown = Shown, Skin = Skin, Text = Text, Tip = Tip, Button = Button, Edit = Edit, Check = Check,
