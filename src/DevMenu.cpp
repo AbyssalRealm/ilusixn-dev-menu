@@ -1,0 +1,2429 @@
+/*
+ * CoA Dev Menu - server side of the in-game NPC/creature editor (client addon: DevMenu).
+ *
+ * Transport: the addon whispers itself an addon message "CDEV\tQ~OP~arg~arg...".
+ * Replies go back the same way ("CDEV\t<CODE>~field~field..."). GM accounts only.
+ * Every edit is written to the world DB and applied live (no restart needed),
+ * except equipment of a freshly cloned template, which loads after a restart.
+ */
+
+#include "CellImpl.h"
+#include "Chat.h"
+#include "Config.h"
+#include "Creature.h"
+#include "CreatureData.h"
+#include "DatabaseEnv.h"
+#include "DBCStores.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "Log.h"
+#include "Map.h"
+#include "MotionMaster.h"
+#include "ObjectAccessor.h"
+#include "ObjectMgr.h"
+#include "Player.h"
+#include "PlayerScript.h"
+#include "ScriptMgr.h"
+#include "TemporarySummon.h"
+#include "WaypointMgr.h"
+#include "WorldPacket.h"
+#include "WorldSession.h"
+#include "GameObject.h"
+#include "SmartScriptMgr.h"
+#include "Spell.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
+#include "Transport.h"
+#include "QuestDef.h"
+#include <G3D/Matrix3.h>
+#include <set>
+#include <mutex>
+#include "WorldScript.h"
+#include "ServerScript.h"
+#include "Opcodes.h"
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
+
+namespace
+{
+    constexpr char const* PREFIX = "CDEV";
+    constexpr uint32 CLONE_FIRST = 9980001;   // entries made by "make unique"
+    constexpr uint32 CLONE_LAST = 9989999;
+    constexpr uint32 PAGE_SIZE = 30;
+    constexpr uint32 MARKER_MS = 15 * 60 * 1000;
+
+    struct EditState
+    {
+        std::vector<Position> path;
+        std::vector<ObjectGuid> markers;
+    };
+    std::unordered_map<ObjectGuid::LowType, EditState> g_state;
+    std::vector<std::pair<ObjectGuid, std::string>> g_queue;   // requests waiting for the world thread
+    std::mutex g_queueLock;
+
+    void RefreshLook(Creature* c);
+
+    std::string Clean(std::string s, size_t maxLen = 80)
+    {
+        for (char& c : s)
+            if (c == '~' || c == '\t' || c == '|' || c == '\n' || c == '\r')
+                c = ' ';
+        if (s.size() > maxLen)
+            s.resize(maxLen);
+        return s;
+    }
+
+    std::string Lower(std::string s)
+    {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        return s;
+    }
+
+    std::vector<std::string> Split(std::string const& s, char d)
+    {
+        std::vector<std::string> out;
+        std::string cur;
+        for (char c : s)
+        {
+            if (c == d) { out.push_back(cur); cur.clear(); }
+            else cur += c;
+        }
+        out.push_back(cur);
+        return out;
+    }
+
+    uint32 U(std::vector<std::string> const& a, size_t i, uint32 def = 0)
+    {
+        if (i >= a.size() || a[i].empty())
+            return def;
+        return uint32(std::strtoul(a[i].c_str(), nullptr, 10));
+    }
+
+    float F(std::vector<std::string> const& a, size_t i, float def = 0.f)
+    {
+        if (i >= a.size() || a[i].empty())
+            return def;
+        return std::strtof(a[i].c_str(), nullptr);
+    }
+
+    std::string S(std::vector<std::string> const& a, size_t i)
+    {
+        return i < a.size() ? a[i] : std::string();
+    }
+
+    template <typename... Args>
+    std::string Join(Args const&... args)
+    {
+        std::ostringstream ss;
+        ss.setf(std::ios::fixed);
+        ss.precision(2);
+        bool first = true;
+        ((ss << (first ? "" : "~") << args, first = false), ...);
+        return ss.str();
+    }
+
+    void Send(Player* p, std::string const& text)
+    {
+        WorldPacket data;
+        ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, LANG_ADDON, p, p, std::string(PREFIX) + "\t" + text);
+        p->GetSession()->SendPacket(&data);
+    }
+
+    void Ok(Player* p, std::string const& msg) { Send(p, Join("OK", Clean(msg, 200))); }
+    void Err(Player* p, std::string const& msg) { Send(p, Join("ER", Clean(msg, 200))); }
+
+    char Reaction(CreatureTemplate const* ct)
+    {
+        if (ct->type == CREATURE_TYPE_CRITTER)
+            return 'C';
+        FactionTemplateEntry const* ft = sFactionTemplateStore.LookupEntry(ct->faction);
+        if (!ft)
+            return 'N';
+        if (ft->IsHostileToPlayers())
+            return 'H';
+        if (ft->IsNeutralToAll())
+            return 'N';
+        return 'F';
+    }
+
+    // Warm the client's creature cache so names and the Ctrl+click 3D preview work instantly
+    void SendQuery(Player* p, CreatureTemplate const* ct)
+    {
+        WorldPacket pkt(ct->queryData);
+        p->GetSession()->SendPacket(&pkt);
+    }
+
+    CreatureTemplate* MutableTemplate(uint32 entry)
+    {
+        return const_cast<CreatureTemplate*>(sObjectMgr->GetCreatureTemplate(entry));
+    }
+
+    Creature* FindSpawn(Player* p, ObjectGuid::LowType guid)
+    {
+        ChatHandler handler(p->GetSession());
+        return handler.GetCreatureFromPlayerMapByDbGuid(guid);
+    }
+
+    uint32 CountSpawnsOfEntry(uint32 entry)
+    {
+        if (QueryResult r = WorldDatabase.Query("SELECT COUNT(*) FROM creature WHERE id = {}", entry))
+            return r->Fetch()[0].Get<uint32>();
+        return 0;
+    }
+
+    void RestartMovement(Creature* c)
+    {
+        c->GetMotionMaster()->Initialize();
+        if (c->IsAlive())
+        {
+            c->setDeathState(DeathState::JustDied);
+            c->Respawn(true);
+        }
+    }
+
+    void SendInfo(Player* p, Creature* c)
+    {
+        CreatureTemplate const* ct = c->GetCreatureTemplate();
+        CreatureData const* d = sObjectMgr->GetCreatureData(c->GetSpawnId());
+        uint32 pathId = c->GetWaypointPath();
+        uint32 pts = 0;
+        if (pathId)
+            if (WaypointPath const* wp = sWaypointMgr->GetPath(pathId))
+                pts = uint32(wp->Nodes.size());
+        uint32 emote = c->GetUInt32Value(UNIT_NPC_EMOTESTATE);
+        SendQuery(p, ct);
+        Send(p, Join("IN", c->GetSpawnId(), c->GetEntry(), Clean(ct->Name, 60), Clean(ct->SubName, 60),
+            c->GetPositionX(), c->GetPositionY(), c->GetPositionZ(), c->GetOrientation(),
+            uint32(c->GetDefaultMovementType()), c->GetWanderDistance(), emote, c->GetNpcFlags(),
+            ct->faction, pathId, pts, uint32(ct->minlevel), uint32(ct->maxlevel), c->GetDisplayId(),
+            d ? d->spawntimesecs : 0, std::string(1, Reaction(ct)), (ct->flags_extra & CREATURE_FLAG_EXTRA_GUARD) ? 1 : 0,
+            CountSpawnsOfEntry(c->GetEntry()), ct->npcflag));
+    }
+
+    void ClearMarkers(Player* p, EditState& st)
+    {
+        for (ObjectGuid const& g : st.markers)
+            if (Creature* m = ObjectAccessor::GetCreature(*p, g))
+                m->DespawnOrUnsummon();
+        st.markers.clear();
+    }
+
+    void AddMarker(Player* p, EditState& st, Position const& pos)
+    {
+        if (TempSummon* m = p->SummonCreature(VISUAL_WAYPOINT, pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(), pos.GetOrientation(), TEMPSUMMON_TIMED_DESPAWN, MARKER_MS))
+            st.markers.push_back(m->GetGUID());
+    }
+
+    // Writes creature_addon and updates the in-memory copy without any core change:
+    // edit the existing entry in place, or (first edit of this spawn) reload the table.
+    // Chat packets are handled in the world thread while maps are idle, so the reload is safe.
+    void SaveAddon(ObjectGuid::LowType guid, uint32 pathId, uint32 emote, bool setPath, bool setEmote)
+    {
+        WorldDatabase.DirectExecute("INSERT IGNORE INTO creature_addon (guid) VALUES ({})", guid);
+        if (setPath)
+            WorldDatabase.DirectExecute("UPDATE creature_addon SET path_id = {} WHERE guid = {}", pathId, guid);
+        if (setEmote)
+            WorldDatabase.DirectExecute("UPDATE creature_addon SET emote = {} WHERE guid = {}", emote, guid);
+        if (CreatureAddon const* a = sObjectMgr->GetCreatureAddon(guid))
+        {
+            CreatureAddon* m = const_cast<CreatureAddon*>(a);
+            if (setPath) m->path_id = pathId;
+            if (setEmote) m->emote = emote;
+        }
+        else
+            sObjectMgr->LoadCreatureAddons();
+    }
+
+    // Copies a creature_template (DB + memory) into the dev clone range; returns the new entry or 0
+    uint32 CloneTemplate(uint32 base)
+    {
+        CreatureTemplate const* src = sObjectMgr->GetCreatureTemplate(base);
+        if (!src)
+            return 0;
+
+        uint32 entry = CLONE_FIRST;
+        if (QueryResult r = WorldDatabase.Query("SELECT MAX(entry) FROM creature_template WHERE entry BETWEEN {} AND {}", CLONE_FIRST, CLONE_LAST))
+            if (!r->Fetch()[0].IsNull())
+                entry = r->Fetch()[0].Get<uint32>() + 1;
+        while (entry <= CLONE_LAST && sObjectMgr->GetCreatureTemplate(entry))
+            ++entry;
+        if (entry > CLONE_LAST)
+            return 0;
+
+        auto copyRows = [&](char const* table, char const* keyCol)
+        {
+            QueryResult cols = WorldDatabase.Query("SHOW COLUMNS FROM `{}`", table);
+            if (!cols)
+                return;
+            std::string colList, selList;
+            do
+            {
+                std::string c = cols->Fetch()[0].Get<std::string>();
+                if (!colList.empty()) { colList += ","; selList += ","; }
+                colList += "`" + c + "`";
+                selList += (c == keyCol) ? std::to_string(entry) : "`" + c + "`";
+            } while (cols->NextRow());
+            WorldDatabase.DirectExecute("INSERT INTO `{}` ({}) SELECT {} FROM `{}` WHERE `{}` = {}", table, colList, selList, table, keyCol, base);
+        };
+        copyRows("creature_template", "entry");
+        copyRows("creature_template_model", "CreatureID");
+        copyRows("creature_equip_template", "CreatureID");
+
+        WorldDatabasePreparedStatement* stmt = WorldDatabase.GetPreparedStatement(WORLD_SEL_CREATURE_TEMPLATE);
+        stmt->SetData(0, entry);
+        PreparedQueryResult res = WorldDatabase.Query(stmt);
+        if (!res)
+            return 0;
+        sObjectMgr->LoadCreatureTemplate(res->Fetch(), true);
+
+        CreatureTemplate* dst = MutableTemplate(entry);
+        if (!dst)
+            return 0;
+        dst->Models = src->Models;
+        for (uint8 i = 0; i < MAX_SPELL_SCHOOL; ++i)
+            dst->resistance[i] = src->resistance[i];
+        for (uint8 i = 0; i < MAX_CREATURE_SPELLS; ++i)
+            dst->spells[i] = src->spells[i];
+        sObjectMgr->CheckCreatureTemplate(dst);
+        dst->InitializeQueryData();
+
+        if (VendorItemData const* vendor = sObjectMgr->GetNpcVendorItemList(base))
+            for (VendorItem const* vi : vendor->m_items)
+                if (vi)
+                    sObjectMgr->AddVendorItem(entry, vi->item, vi->maxcount, vi->incrtime, vi->ExtendedCost, true);
+        return entry;
+    }
+
+    // Puts the spawn on its own copy of its template so template-level edits only touch it
+    Creature* MakeUnique(Player* p, Creature* c)
+    {
+        uint32 newEntry = CloneTemplate(c->GetEntry());
+        if (!newEntry)
+        {
+            Err(p, "Could not copy the template (dev entry range full?)");
+            return nullptr;
+        }
+        c->UpdateEntry(newEntry, nullptr, true, true);
+        c->SaveToDB();
+        return c;
+    }
+
+    void ApplyTemplateChange(Player* p, CreatureTemplate* ct)
+    {
+        ct->InitializeQueryData();
+        SendQuery(p, ct);
+    }
+
+    // ---------------------------------------------------------------- handlers
+    void OpSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 page = U(a, 3);
+        uint32 filter = U(a, 4);   // 0 all, 1 friendly, 2 hostile, 3 neutral, 4 critter, 5 vendors/services, 6 dev made
+        uint32 qEntry = uint32(std::strtoul(q.c_str(), nullptr, 10));
+
+        std::vector<CreatureTemplate const*> hits;
+        for (auto const& [entry, ct] : *sObjectMgr->GetCreatureTemplates())
+        {
+            if (!q.empty() && entry != qEntry && Lower(ct.Name).find(q) == std::string::npos && Lower(ct.SubName).find(q) == std::string::npos)
+                continue;
+            char r = Reaction(&ct);
+            switch (filter)
+            {
+                case 1: if (r != 'F') continue; break;
+                case 2: if (r != 'H') continue; break;
+                case 3: if (r != 'N') continue; break;
+                case 4: if (r != 'C') continue; break;
+                case 5: if (!ct.npcflag) continue; break;
+                case 6: if (entry < 9900000) continue; break;
+                default: break;
+            }
+            hits.push_back(&ct);
+        }
+        std::sort(hits.begin(), hits.end(), [&](CreatureTemplate const* x, CreatureTemplate const* y)
+        {
+            bool xe = x->Entry == qEntry, ye = y->Entry == qEntry;
+            if (xe != ye) return xe;
+            if (x->Name != y->Name) return x->Name < y->Name;
+            return x->Entry < y->Entry;
+        });
+        uint32 total = uint32(hits.size());
+        uint32 pages = std::max<uint32>(1, (total + PAGE_SIZE - 1) / PAGE_SIZE);
+        page = std::min(page, pages - 1);
+        Send(p, Join("SB", total, page, pages));
+        for (uint32 i = page * PAGE_SIZE; i < std::min(total, (page + 1) * PAGE_SIZE); ++i)
+        {
+            CreatureTemplate const* ct = hits[i];
+            SendQuery(p, ct);
+            CreatureModel const* m = ct->GetFirstValidModel();
+            Send(p, Join("SR", ct->Entry, Clean(ct->Name, 60), Clean(ct->SubName, 50), uint32(ct->minlevel), uint32(ct->maxlevel),
+                std::string(1, Reaction(ct)), ct->npcflag, ct->rank, ct->type, m ? m->CreatureDisplayID : 0));
+        }
+        Send(p, Join("SE", total, page, pages));
+    }
+
+    void OpSpawn(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 entry = U(a, 2);
+        bool save = U(a, 3, 1) != 0;
+        if (!sObjectMgr->GetCreatureTemplate(entry))
+            return Err(p, "Unknown creature entry " + std::to_string(entry));
+        if (p->GetTransport())
+            return Err(p, "Step off the transport first (use .npc add there)");
+
+        if (!save)
+        {
+            p->SummonCreature(entry, p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), p->GetOrientation(), TEMPSUMMON_TIMED_DESPAWN, 5 * 60 * 1000);
+            return Ok(p, "Preview spawned (despawns in 5 min, not saved)");
+        }
+
+        Map* map = p->GetMap();
+        Creature* c = new Creature();
+        if (!c->Create(map->GenerateLowGuid<HighGuid::Unit>(), map, p->GetPhaseMaskForSpawn(), entry, 0, p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), p->GetOrientation()))
+        {
+            delete c;
+            return Err(p, "Create failed");
+        }
+        c->SaveToDB(map->GetId(), (1 << map->GetSpawnMode()), p->GetPhaseMaskForSpawn());
+        ObjectGuid::LowType spawnId = c->GetSpawnId();
+        c->CleanupsBeforeDelete();
+        delete c;
+        c = new Creature();
+        if (!c->LoadCreatureFromDB(spawnId, map, true, true))
+        {
+            delete c;
+            return Err(p, "Saved but failed to load spawn " + std::to_string(spawnId));
+        }
+        sObjectMgr->AddCreatureToGrid(spawnId, sObjectMgr->GetCreatureData(spawnId));
+        Ok(p, "Spawned and saved (guid " + std::to_string(spawnId) + ")");
+        SendInfo(p, c);
+    }
+
+    // Duplicate any NPC type into a brand-new one (new entry) with its own name; no spawn needed
+    void OpDuplicate(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 base = U(a, 2);
+        std::string name = Clean(S(a, 3), 90), sub = Clean(S(a, 4), 90);
+        CreatureTemplate const* src = sObjectMgr->GetCreatureTemplate(base);
+        if (!src)
+            return Err(p, "Unknown creature entry " + std::to_string(base));
+        if (name.empty())
+            name = src->Name + " (copy)";
+        uint32 entry = CloneTemplate(base);
+        if (!entry)
+            return Err(p, "Could not duplicate (dev entry range full?)");
+        CreatureTemplate* ct = MutableTemplate(entry);
+        ct->Name = name;
+        ct->SubName = sub;
+        std::string en = name, es = sub;
+        WorldDatabase.EscapeString(en);
+        WorldDatabase.EscapeString(es);
+        WorldDatabase.DirectExecute("UPDATE creature_template SET name = '{}', subname = '{}' WHERE entry = {}", en, es, entry);
+        ApplyTemplateChange(p, ct);
+        CreatureModel const* m = ct->GetFirstValidModel();
+        Send(p, Join("DP", entry, Clean(ct->Name, 60), Clean(ct->SubName, 50), uint32(ct->minlevel), uint32(ct->maxlevel),
+            std::string(1, Reaction(ct)), ct->npcflag, ct->rank, ct->type, m ? m->CreatureDisplayID : 0));
+        Ok(p, "New NPC " + std::to_string(entry) + " created from " + std::to_string(base) + ". Spawn it, then edit it freely.");
+    }
+
+    // Rename an NPC type by entry (all its spawns), straight from a list
+    void OpRenameType(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 entry = U(a, 2);
+        std::string name = Clean(S(a, 3), 90), sub = Clean(S(a, 4), 90);
+        CreatureTemplate* ct = MutableTemplate(entry);
+        if (!ct)
+            return Err(p, "Unknown creature entry " + std::to_string(entry));
+        if (name.empty())
+            return Err(p, "Name can't be empty");
+        ct->Name = name;
+        ct->SubName = sub;
+        std::string en = name, es = sub;
+        WorldDatabase.EscapeString(en);
+        WorldDatabase.EscapeString(es);
+        WorldDatabase.DirectExecute("UPDATE creature_template SET name = '{}', subname = '{}' WHERE entry = {}", en, es, entry);
+        ApplyTemplateChange(p, ct);
+        CreatureModel const* m = ct->GetFirstValidModel();
+        Send(p, Join("RT", entry, Clean(ct->Name, 60), Clean(ct->SubName, 50), uint32(ct->minlevel), uint32(ct->maxlevel),
+            std::string(1, Reaction(ct)), ct->npcflag, ct->rank, ct->type, m ? m->CreatureDisplayID : 0));
+        Ok(p, "Renamed NPC type " + std::to_string(entry) + " (" + std::to_string(CountSpawnsOfEntry(entry)) + " spawns use it)");
+    }
+
+    // ---------------- Advanced: every useful creature_template field, editable by name
+    struct TField
+    {
+        char const* key;      // protocol key
+        char const* column;   // creature_template column
+        bool query;           // part of the client query packet (resend)
+        std::function<double(CreatureTemplate const&)> get;
+        std::function<void(CreatureTemplate&, double)> set;
+    };
+
+    std::vector<TField> const& TFields()
+    {
+        static std::vector<TField> const f = {
+            { "minlevel", "minlevel", false, [](auto& t) { return t.minlevel; }, [](auto& t, double v) { t.minlevel = uint8(std::clamp(v, 1.0, 83.0)); } },
+            { "maxlevel", "maxlevel", false, [](auto& t) { return t.maxlevel; }, [](auto& t, double v) { t.maxlevel = uint8(std::clamp(v, 1.0, 83.0)); } },
+            { "faction", "faction", false, [](auto& t) { return t.faction; }, [](auto& t, double v) { t.faction = uint32(v); } },
+            { "rank", "rank", true, [](auto& t) { return t.rank; }, [](auto& t, double v) { t.rank = uint32(std::clamp(v, 0.0, 4.0)); } },
+            { "type", "type", true, [](auto& t) { return t.type; }, [](auto& t, double v) { t.type = uint32(v); } },
+            { "family", "family", true, [](auto& t) { return t.family; }, [](auto& t, double v) { t.family = uint32(v); } },
+            { "unit_class", "unit_class", false, [](auto& t) { return t.unit_class; }, [](auto& t, double v) { t.unit_class = uint32(v); } },
+            { "health", "HealthModifier", false, [](auto& t) { return t.ModHealth; }, [](auto& t, double v) { t.ModHealth = float(v); } },
+            { "mana", "ManaModifier", false, [](auto& t) { return t.ModMana; }, [](auto& t, double v) { t.ModMana = float(v); } },
+            { "damage", "DamageModifier", false, [](auto& t) { return t.DamageModifier; }, [](auto& t, double v) { t.DamageModifier = float(v); } },
+            { "armor", "ArmorModifier", false, [](auto& t) { return t.ModArmor; }, [](auto& t, double v) { t.ModArmor = float(v); } },
+            { "xp", "ExperienceModifier", false, [](auto& t) { return t.ModExperience; }, [](auto& t, double v) { t.ModExperience = float(v); } },
+            { "attacktime", "BaseAttackTime", false, [](auto& t) { return t.BaseAttackTime; }, [](auto& t, double v) { t.BaseAttackTime = uint32(v); } },
+            { "walk", "speed_walk", false, [](auto& t) { return t.speed_walk; }, [](auto& t, double v) { t.speed_walk = float(v); } },
+            { "run", "speed_run", false, [](auto& t) { return t.speed_run; }, [](auto& t, double v) { t.speed_run = float(v); } },
+            { "aggro", "detection_range", false, [](auto& t) { return t.detection_range; }, [](auto& t, double v) { t.detection_range = float(v); } },
+            { "hover", "HoverHeight", false, [](auto& t) { return t.HoverHeight; }, [](auto& t, double v) { t.HoverHeight = float(v); } },
+            { "mingold", "mingold", false, [](auto& t) { return t.mingold; }, [](auto& t, double v) { t.mingold = uint32(v); } },
+            { "maxgold", "maxgold", false, [](auto& t) { return t.maxgold; }, [](auto& t, double v) { t.maxgold = uint32(v); } },
+            { "lootid", "lootid", false, [](auto& t) { return t.lootid; }, [](auto& t, double v) { t.lootid = uint32(v); } },
+            { "gossip", "gossip_menu_id", false, [](auto& t) { return t.GossipMenuId; }, [](auto& t, double v) { t.GossipMenuId = uint32(v); } },
+            { "regen", "RegenHealth", false, [](auto& t) { return t.RegenHealth ? 1 : 0; }, [](auto& t, double v) { t.RegenHealth = v != 0; } },
+            { "unit_flags", "unit_flags", false, [](auto& t) { return t.unit_flags; }, [](auto& t, double v) { t.unit_flags = uint32(v); } },
+            { "flags_extra", "flags_extra", false, [](auto& t) { return t.flags_extra; }, [](auto& t, double v) { t.flags_extra = uint32(v); } },
+            { "type_flags", "type_flags", true, [](auto& t) { return t.type_flags; }, [](auto& t, double v) { t.type_flags = uint32(v); } },
+            { "npcflag_tpl", "npcflag", false, [](auto& t) { return t.npcflag; }, [](auto& t, double v) { t.npcflag = uint32(v); } },
+        };
+        return f;
+    }
+
+    void SendAdvanced(Player* p, Creature* c)
+    {
+        CreatureTemplate const* ct = c->GetCreatureTemplate();
+        Send(p, Join("TB", c->GetSpawnId()));
+        for (TField const& f : TFields())
+            Send(p, Join("TV", f.key, f.get(*ct)));
+        CreatureData const* d = sObjectMgr->GetCreatureData(c->GetSpawnId());
+        Send(p, Join("TV", "spawntime", d ? d->spawntimesecs : 0));
+        if (ReputationOnKillEntry const* r = sObjectMgr->GetReputationOnKilEntry(c->GetEntry()))
+            Send(p, Join("RP", r->RepFaction1, r->RepValue1, r->ReputationMaxCap1));
+        else if (QueryResult q = WorldDatabase.Query("SELECT RewOnKillRepFaction1, RewOnKillRepValue1, MaxStanding1 FROM creature_onkill_reputation WHERE creature_id = {}", c->GetEntry()))
+            Send(p, Join("RP", q->Fetch()[0].Get<uint32>(), q->Fetch()[1].Get<float>(), q->Fetch()[2].Get<uint32>()));
+        else
+            Send(p, Join("RP", 0, 0, 0));
+        Send(p, Join("TE", c->GetSpawnId()));
+    }
+
+    void RefreshFromTemplate(Creature* c)
+    {
+        c->UpdateEntry(c->GetEntry(), sObjectMgr->GetCreatureData(c->GetSpawnId()), true, true);
+        RestartMovement(c);
+    }
+
+    void OpTSet(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        std::string key = S(a, 3);
+        auto const& fields = TFields();
+        auto it = std::find_if(fields.begin(), fields.end(), [&](TField const& f) { return key == f.key; });
+        if (key == "spawntime")
+        {
+            c->SetRespawnDelay(U(a, 4));
+            c->SaveToDB();
+            Ok(p, "Respawn time saved for this spawn");
+            return SendAdvanced(p, c);
+        }
+        if (it == fields.end())
+            return Err(p, "Unknown field " + Clean(key, 30));
+        double v = std::strtod(S(a, 4).c_str(), nullptr);
+        if (key == "faction" && !sFactionTemplateStore.LookupEntry(uint32(v)))
+            return Err(p, "Unknown faction template " + S(a, 4));
+        if (U(a, 5) && !(c = MakeUnique(p, c)))
+            return;
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        it->set(*ct, v);
+        WorldDatabase.DirectExecute("UPDATE creature_template SET `{}` = {} WHERE entry = {}", it->column, it->get(*ct), ct->Entry);
+        if (it->query)
+            ApplyTemplateChange(p, ct);
+        RefreshFromTemplate(c);
+        Ok(p, std::string(it->key) + " saved");
+        SendInfo(p, c);
+        SendAdvanced(p, c);
+    }
+
+    void OpRep(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 faction = U(a, 3);
+        float value = F(a, 4);
+        uint32 cap = std::min<uint32>(U(a, 5, 7), 7);
+        if (faction && !sFactionStore.LookupEntry(faction))
+            return Err(p, "Unknown faction (reputation) id " + std::to_string(faction));
+        if (U(a, 6) && !(c = MakeUnique(p, c)))
+            return;
+        uint32 entry = c->GetEntry();
+        if (!faction)
+            WorldDatabase.DirectExecute("DELETE FROM creature_onkill_reputation WHERE creature_id = {}", entry);
+        else
+            WorldDatabase.DirectExecute("REPLACE INTO creature_onkill_reputation (creature_id, RewOnKillRepFaction1, RewOnKillRepFaction2, MaxStanding1, IsTeamAward1, RewOnKillRepValue1, MaxStanding2, IsTeamAward2, RewOnKillRepValue2, TeamDependent) "
+                "VALUES ({}, {}, 0, {}, 0, {}, 0, 0, 0, 0)", entry, faction, cap, value);
+        bool live = false;
+        if (ReputationOnKillEntry const* r = sObjectMgr->GetReputationOnKilEntry(entry))
+        {
+            ReputationOnKillEntry* m = const_cast<ReputationOnKillEntry*>(r);
+            m->RepFaction1 = faction; m->RepValue1 = value; m->ReputationMaxCap1 = cap;
+            live = true;
+        }
+        Ok(p, faction ? (live ? "Kill reputation saved (live)" : "Kill reputation saved (works after the next server restart)") : "Kill reputation removed");
+        SendAdvanced(p, c);
+    }
+
+    void OpNear(Player* p, std::vector<std::string> const& a)
+    {
+        float radius = std::clamp(F(a, 2, 30.f), 2.f, 200.f);
+        std::list<Creature*> list;
+        Acore::AllWorldObjectsInRange check(p, radius);
+        Acore::CreatureListSearcher<Acore::AllWorldObjectsInRange> searcher(p, list, check);
+        Cell::VisitObjects(p, searcher, radius);
+        std::vector<Creature*> v;
+        for (Creature* c : list)
+            if (c->GetSpawnId() && !c->IsPet() && c->GetEntry() != VISUAL_WAYPOINT)
+                v.push_back(c);
+        std::sort(v.begin(), v.end(), [p](Creature* x, Creature* y) { return p->GetDistance(x) < p->GetDistance(y); });
+        if (v.size() > 60)
+            v.resize(60);
+        Send(p, Join("NB", uint32(v.size())));
+        for (Creature* c : v)
+        {
+            SendQuery(p, c->GetCreatureTemplate());
+            Send(p, Join("NR", c->GetSpawnId(), c->GetEntry(), Clean(c->GetCreatureTemplate()->Name, 60), p->GetDistance(c), std::string(1, Reaction(c->GetCreatureTemplate()))));
+        }
+        Send(p, Join("NE", uint32(v.size())));
+    }
+
+    Creature* Target(Player* p, std::vector<std::string> const& a)
+    {
+        ObjectGuid::LowType guid = U(a, 2);
+        Creature* c = nullptr;
+        if (guid)
+            c = FindSpawn(p, guid);
+        else if (Unit* u = p->GetSelectedUnit())
+            c = u->ToCreature();
+        if (!c || !c->GetSpawnId())
+        {
+            Err(p, guid ? "Spawn not found on your map (move closer?)" : "Target a saved NPC first");
+            return nullptr;
+        }
+        return c;
+    }
+
+    void SetPos(Creature* c, float x, float y, float z, float o)
+    {
+        CreatureData const* d = sObjectMgr->GetCreatureData(c->GetSpawnId());
+        if (d)
+        {
+            sObjectMgr->RemoveCreatureFromGrid(c->GetSpawnId(), d);
+            CreatureData* md = const_cast<CreatureData*>(d);
+            md->posX = x; md->posY = y; md->posZ = z; md->orientation = o;
+            sObjectMgr->AddCreatureToGrid(c->GetSpawnId(), d);
+        }
+        WorldDatabase.DirectExecute("UPDATE creature SET position_x = {}, position_y = {}, position_z = {}, orientation = {} WHERE guid = {}", x, y, z, o, c->GetSpawnId());
+        c->SetHomePosition(x, y, z, o);
+        c->NearTeleportTo(x, y, z, o);
+        c->GetMotionMaster()->Initialize();
+    }
+
+    void OpMoveHere(Player* p, Creature* c)
+    {
+        if (p->GetMapId() != c->GetMapId())
+            return Err(p, "Different map");
+        SetPos(c, p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), p->GetOrientation());
+        Ok(p, "Moved to you and saved");
+        SendInfo(p, c);
+    }
+
+    void OpNudge(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        float fwd = F(a, 3), right = F(a, 4), up = F(a, 5), turnDeg = F(a, 6);
+        float po = p->GetOrientation();
+        float x = c->GetHomePosition().GetPositionX() + std::cos(po) * fwd + std::cos(po - float(M_PI) / 2) * right;
+        float y = c->GetHomePosition().GetPositionY() + std::sin(po) * fwd + std::sin(po - float(M_PI) / 2) * right;
+        float z = c->GetHomePosition().GetPositionZ() + up;
+        float o = Position::NormalizeOrientation(c->GetHomePosition().GetOrientation() + turnDeg * float(M_PI) / 180.f);
+        SetPos(c, x, y, z, o);
+        SendInfo(p, c);
+    }
+
+    // world-axis nudge (dx dy dz, yards) and absolute facing (degrees)
+    void OpNudgeW(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        Position const& h = c->GetHomePosition();
+        SetPos(c, h.GetPositionX() + F(a, 3), h.GetPositionY() + F(a, 4), h.GetPositionZ() + F(a, 5), h.GetOrientation());
+        SendInfo(p, c);
+    }
+
+    void OpSetO(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        Position const& h = c->GetHomePosition();
+        SetPos(c, h.GetPositionX(), h.GetPositionY(), h.GetPositionZ(), Position::NormalizeOrientation(F(a, 3) * float(M_PI) / 180.f));
+        SendInfo(p, c);
+    }
+
+    void OpFace(Player* p, Creature* c)
+    {
+        Position const& h = c->GetHomePosition();
+        SetPos(c, h.GetPositionX(), h.GetPositionY(), h.GetPositionZ(), c->GetAngle(p));
+        Ok(p, "Now faces you (saved)");
+        SendInfo(p, c);
+    }
+
+    void OpDelete(Player* p, Creature* c)
+    {
+        ObjectGuid::LowType guid = c->GetSpawnId();
+        uint32 path = c->GetWaypointPath();
+        c->CombatStop();
+        c->DeleteFromDB();
+        c->AddObjectToRemoveList();
+        WorldDatabase.DirectExecute("DELETE FROM creature_addon WHERE guid = {}", guid);
+        if (path == guid * 10)
+            WorldDatabase.DirectExecute("DELETE FROM waypoint_data WHERE id = {}", path);
+        Ok(p, "Deleted spawn " + std::to_string(guid));
+        Send(p, "DL~" + std::to_string(guid));
+    }
+
+    void OpMoveType(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 type = U(a, 3);
+        float wander = F(a, 4, 5.f);
+        if (type == 2 && !c->GetWaypointPath())
+            return Err(p, "Record a path first (Path tab)");
+        if (type == 1 && wander < 0.5f)
+            wander = 5.f;
+        c->SetWanderDistance(type == 1 ? wander : 0.f);
+        c->SetDefaultMovementType(MovementGeneratorType(type == 2 ? WAYPOINT_MOTION_TYPE : (type == 1 ? RANDOM_MOTION_TYPE : IDLE_MOTION_TYPE)));
+        RestartMovement(c);
+        c->SaveToDB();
+        Ok(p, type == 0 ? "Stands still" : (type == 1 ? "Wanders around its spot" : "Walks its path"));
+        SendInfo(p, c);
+    }
+
+    void OpEmote(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 emote = U(a, 3);
+        if (emote && !sEmotesStore.LookupEntry(emote))
+            return Err(p, "Unknown emote id " + std::to_string(emote));
+        // sit / sleep / kneel / dead are stand states for NPCs: the emote state alone does nothing on most models
+        uint8 stand = emote == EMOTE_STATE_SIT ? UNIT_STAND_STATE_SIT : emote == EMOTE_STATE_SLEEP ? UNIT_STAND_STATE_SLEEP
+            : emote == EMOTE_STATE_KNEEL ? UNIT_STAND_STATE_KNEEL : emote == EMOTE_STATE_DEAD ? UNIT_STAND_STATE_DEAD : UNIT_STAND_STATE_STAND;
+        uint32 loop = stand == UNIT_STAND_STATE_STAND ? emote : 0;
+        c->SetUInt32Value(UNIT_NPC_EMOTESTATE, loop);
+        c->SetStandState(stand);
+        SaveAddon(c->GetSpawnId(), 0, loop, false, true);
+        WorldDatabase.DirectExecute("UPDATE creature_addon SET bytes1 = (bytes1 & 0xFFFFFF00) | {} WHERE guid = {}", uint32(stand), c->GetSpawnId());
+        if (CreatureAddon const* ad = sObjectMgr->GetCreatureAddon(c->GetSpawnId()))
+            const_cast<CreatureAddon*>(ad)->bytes1 = (ad->bytes1 & 0xFFFFFF00) | stand;
+        Ok(p, stand != UNIT_STAND_STATE_STAND ? "Pose saved" : (emote ? "Looping emote saved" : "Emote cleared"));
+        SendInfo(p, c);
+    }
+
+    void OpPlay(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        c->HandleEmoteCommand(U(a, 3));
+        (void)p;
+    }
+
+    void OpRole(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 flags = U(a, 3);
+        c->ReplaceAllNpcFlags(NPCFlags(flags));
+        c->SaveToDB();
+        Ok(p, "Role saved for this spawn");
+        SendInfo(p, c);
+    }
+
+    void OpGuard(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        bool on = U(a, 3) != 0;
+        if (U(a, 4) && !(c = MakeUnique(p, c)))
+            return;
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        if (on) ct->flags_extra |= CREATURE_FLAG_EXTRA_GUARD;
+        else ct->flags_extra &= ~uint32(CREATURE_FLAG_EXTRA_GUARD);
+        WorldDatabase.DirectExecute("UPDATE creature_template SET flags_extra = {} WHERE entry = {}", ct->flags_extra, ct->Entry);
+        c->AIM_Initialize();
+        Ok(p, on ? "Guard behaviour on (attacks hostiles near it)" : "Guard behaviour off");
+        SendInfo(p, c);
+    }
+
+    void OpFaction(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 faction = U(a, 3);
+        if (!sFactionTemplateStore.LookupEntry(faction))
+            return Err(p, "Unknown faction template " + std::to_string(faction));
+        if (U(a, 4) && !(c = MakeUnique(p, c)))
+            return;
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        ct->faction = faction;
+        WorldDatabase.DirectExecute("UPDATE creature_template SET faction = {} WHERE entry = {}", faction, ct->Entry);
+        c->SetFaction(faction);
+        Ok(p, "Faction saved");
+        SendInfo(p, c);
+    }
+
+    void OpRename(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        std::string name = Clean(S(a, 3), 90), sub = Clean(S(a, 4), 90);
+        if (name.empty())
+            return Err(p, "Name can't be empty");
+        if (U(a, 5) && !(c = MakeUnique(p, c)))
+            return;
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        ct->Name = name;
+        ct->SubName = sub;
+        std::string en = name, es = sub;
+        WorldDatabase.EscapeString(en);
+        WorldDatabase.EscapeString(es);
+        WorldDatabase.DirectExecute("UPDATE creature_template SET name = '{}', subname = '{}' WHERE entry = {}", en, es, ct->Entry);
+        ApplyTemplateChange(p, ct);
+        RestartMovement(c);
+        Ok(p, "Renamed (other players see it after their cache refreshes)");
+        SendInfo(p, c);
+    }
+
+    void OpLevel(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 lo = std::clamp<uint32>(U(a, 3, 1), 1, 83), hi = std::clamp<uint32>(U(a, 4, lo), lo, 83);
+        if (U(a, 5) && !(c = MakeUnique(p, c)))
+            return;
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        ct->minlevel = uint8(lo);
+        ct->maxlevel = uint8(hi);
+        WorldDatabase.DirectExecute("UPDATE creature_template SET minlevel = {}, maxlevel = {} WHERE entry = {}", lo, hi, ct->Entry);
+        RestartMovement(c);
+        Ok(p, "Level range saved");
+        SendInfo(p, c);
+    }
+
+    void OpModel(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 display = U(a, 3);
+        if (!sCreatureDisplayInfoStore.LookupEntry(display))
+            return Err(p, "Unknown display id " + std::to_string(display));
+        if (U(a, 4) && !(c = MakeUnique(p, c)))
+            return;
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        ct->Models.clear();
+        ct->Models.emplace_back(display, 1.f, 1.f);
+        WorldDatabase.DirectExecute("DELETE FROM creature_template_model WHERE CreatureID = {}", ct->Entry);
+        WorldDatabase.DirectExecute("INSERT INTO creature_template_model (CreatureID, Idx, CreatureDisplayID, DisplayScale, Probability, VerifiedBuild) VALUES ({}, 0, {}, 1, 1, 12340)", ct->Entry, display);
+        c->SetDisplayId(display);
+        c->SetNativeDisplayId(display);
+        ApplyTemplateChange(p, ct);
+        Ok(p, "Model saved");
+        SendInfo(p, c);
+    }
+
+    void OpEntry(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 entry = U(a, 3);
+        if (!sObjectMgr->GetCreatureTemplate(entry))
+            return Err(p, "Unknown creature entry " + std::to_string(entry));
+        c->UpdateEntry(entry, nullptr, true, true);
+        c->SaveToDB();
+        RestartMovement(c);
+        RefreshLook(c);   // dressed (mirror image) NPCs: clients ask for the new look
+        Ok(p, "Spawn now uses NPC " + std::to_string(entry));
+        SendInfo(p, c);
+    }
+
+    void OpUnique(Player* p, Creature* c)
+    {
+        if (MakeUnique(p, c))
+        {
+            Ok(p, "This spawn now has its own copy (entry " + std::to_string(c->GetEntry()) + ")");
+            SendInfo(p, c);
+        }
+    }
+
+    void OpVendorAdd(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 item = U(a, 3);
+        if (!sObjectMgr->GetItemTemplate(item))
+            return Err(p, "Unknown item " + std::to_string(item));
+        sObjectMgr->AddVendorItem(c->GetEntry(), item, 0, 0, 0, true);
+        if (!(c->GetNpcFlags() & UNIT_NPC_FLAG_VENDOR))
+        {
+            c->ReplaceAllNpcFlags(NPCFlags(c->GetNpcFlags() | UNIT_NPC_FLAG_VENDOR | UNIT_NPC_FLAG_GOSSIP));
+            c->SaveToDB();
+        }
+        Ok(p, "Item added to this NPC's shop (shared by every spawn of the entry)");
+    }
+
+    void OpRespawn(Player* p, Creature* c)
+    {
+        RestartMovement(c);
+        if (!c->IsAlive())
+            c->Respawn(true);
+        Ok(p, "Respawned");
+    }
+
+    void OpGoto(Player* p, Creature* c)
+    {
+        p->TeleportTo(c->GetMapId(), c->GetPositionX(), c->GetPositionY(), c->GetPositionZ() + 0.5f, p->GetOrientation());
+    }
+
+    // ------------------------------------------------------------- paths
+    // the points the client draws in the path preview (plus where the selected NPC stands)
+    void SendPathList(Player* p, std::vector<Position> const& pts)
+    {
+        Send(p, Join("PLB", uint32(pts.size())));
+        for (size_t i = 0; i < pts.size(); ++i)
+            Send(p, Join("PL", uint32(i + 1), pts[i].GetPositionX(), pts[i].GetPositionY(), pts[i].GetPositionZ()));
+        Send(p, Join("PLE", p->GetPositionX(), p->GetPositionY()));
+    }
+
+    constexpr uint32 CLICK_SPELL = 1543;   // Flare: a ground-targeting spell; the cast is swallowed, only the spot is used
+    std::set<ObjectGuid::LowType> g_clickMode;
+    std::mutex g_clickLock;
+
+    void OpPathClickMode(Player* p, std::vector<std::string> const& a)
+    {
+        bool on = U(a, 2) != 0;
+        {
+            std::lock_guard<std::mutex> lock(g_clickLock);
+            if (on) g_clickMode.insert(p->GetGUID().GetCounter()); else g_clickMode.erase(p->GetGUID().GetCounter());
+        }
+        if (on && !p->HasSpell(CLICK_SPELL))
+            p->learnSpell(CLICK_SPELL, true);
+        else if (!on && p->HasSpell(CLICK_SPELL))
+            p->removeSpell(CLICK_SPELL, SPEC_MASK_ALL, true);
+        Send(p, Join("PM", on ? 1 : 0, CLICK_SPELL));
+    }
+
+    // a ground click from the click spell: becomes a path point (runs in the network/map thread -> queue it)
+    bool AnswerPathClick(WorldSession* session, WorldPacket const& packet)
+    {
+        if (packet.GetOpcode() != CMSG_CAST_SPELL || packet.size() < 6 || !session->GetPlayer())
+            return true;
+        Player* p = session->GetPlayer();
+        uint8 castCount = packet.read<uint8>(0);
+        uint32 spellId = packet.read<uint32>(1);
+        if (spellId != CLICK_SPELL)
+            return true;
+        {
+            std::lock_guard<std::mutex> lock(g_clickLock);
+            if (!g_clickMode.count(p->GetGUID().GetCounter()))
+                return true;
+        }
+        WorldPacket copy(packet);
+        copy.rpos(6);
+        SpellCastTargets targets;
+        targets.Read(copy, p);
+        if (SpellInfo const* si = sSpellMgr->GetSpellInfo(CLICK_SPELL))
+            Spell::SendCastResult(p, si, castCount, SPELL_FAILED_DONT_REPORT);
+        if (targets.HasDst())
+        {
+            WorldLocation const* d = targets.GetDstPos();
+            std::ostringstream ss;
+            ss.setf(std::ios::fixed); ss.precision(3);
+            ss << "Q~PADDAT~" << d->GetPositionX() << "~" << d->GetPositionY() << "~" << d->GetPositionZ();
+            std::lock_guard<std::mutex> lock(g_queueLock);
+            g_queue.emplace_back(p->GetGUID(), ss.str());
+        }
+        return false;   // never really cast it
+    }
+
+    void OpPathAddAt(Player* p, std::vector<std::string> const& a)
+    {
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        Position pos(F(a, 2), F(a, 3), F(a, 4) + 0.1f, 0.f);
+        st.path.push_back(pos);
+        AddMarker(p, st, pos);
+        Send(p, Join("PP", uint32(st.path.size()), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ()));
+        SendPathList(p, st.path);
+    }
+
+    void OpPathAdd(Player* p)
+    {
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        Position pos = p->GetPosition();
+        st.path.push_back(pos);
+        AddMarker(p, st, pos);
+        Send(p, Join("PP", uint32(st.path.size()), pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ()));
+        SendPathList(p, st.path);
+    }
+
+    void OpPathUndo(Player* p)
+    {
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        if (!st.path.empty())
+            st.path.pop_back();
+        if (!st.markers.empty())
+        {
+            if (Creature* m = ObjectAccessor::GetCreature(*p, st.markers.back()))
+                m->DespawnOrUnsummon();
+            st.markers.pop_back();
+        }
+        Send(p, Join("PC", uint32(st.path.size())));
+        SendPathList(p, st.path);
+    }
+
+    void OpPathClear(Player* p)
+    {
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        st.path.clear();
+        ClearMarkers(p, st);
+        Send(p, Join("PC", 0));
+        SendPathList(p, st.path);
+    }
+
+    void OpPathLoad(Player* p, Creature* c, bool editable)
+    {
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        ClearMarkers(p, st);
+        if (editable)
+            st.path.clear();
+        WaypointPath const* wp = c->GetWaypointPath() ? sWaypointMgr->GetPath(c->GetWaypointPath()) : nullptr;
+        if (!wp || wp->Nodes.empty())
+        {
+            Send(p, Join("PC", uint32(st.path.size())));
+            return Err(p, "This NPC has no path");
+        }
+        for (WaypointNode const& n : wp->Nodes)
+        {
+            Position pos(n.X, n.Y, n.Z, 0.f);
+            AddMarker(p, st, pos);
+            if (editable)
+                st.path.push_back(pos);
+        }
+        Send(p, Join("PC", uint32(st.path.size())));
+        std::vector<Position> shown;
+        for (WaypointNode const& n : wp->Nodes)
+            shown.emplace_back(n.X, n.Y, n.Z, 0.f);
+        SendPathList(p, shown);
+        Ok(p, std::to_string(wp->Nodes.size()) + (editable ? " points loaded for editing (markers shown)" : " path points shown"));
+    }
+
+    void OpPathSave(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        if (st.path.size() < 2)
+            return Err(p, "Add at least 2 points (stand somewhere, press Add point)");
+        bool backAndForth = U(a, 3) != 0;
+        uint32 delay = std::min<uint32>(U(a, 4), 600) * 1000;
+        bool run = U(a, 5) != 0;
+
+        std::vector<Position> pts = st.path;
+        if (backAndForth)
+            for (size_t i = st.path.size() - 1; i-- > 1;)
+                pts.push_back(st.path[i]);
+
+        uint32 pathId = c->GetSpawnId() * 10;
+        WorldDatabase.DirectExecute("DELETE FROM waypoint_data WHERE id = {}", pathId);
+        for (size_t i = 0; i < pts.size(); ++i)
+        {
+            bool endStop = (i == 0) || (!backAndForth && i == pts.size() - 1) || (backAndForth && i == st.path.size() - 1);
+            WorldDatabase.DirectExecute("INSERT INTO waypoint_data (id, point, position_x, position_y, position_z, orientation, velocity, delay, smoothTransition, move_type, action, action_chance, wpguid) "
+                "VALUES ({}, {}, {}, {}, {}, NULL, 0, {}, 0, {}, 0, 100, 0)", pathId, i + 1, pts[i].GetPositionX(), pts[i].GetPositionY(), pts[i].GetPositionZ(),
+                endStop ? delay : 0, run ? 1 : 0);
+        }
+        sWaypointMgr->ReloadPath(pathId);
+        SaveAddon(c->GetSpawnId(), pathId, 0, true, false);
+        c->LoadPath(pathId);
+        c->SetWanderDistance(0.f);
+        c->SetDefaultMovementType(WAYPOINT_MOTION_TYPE);
+        Position const& first = st.path.front();
+        SetPos(c, first.GetPositionX(), first.GetPositionY(), first.GetPositionZ(), first.GetOrientation());
+        RestartMovement(c);
+        c->SaveToDB();
+        st.path.clear();
+        ClearMarkers(p, st);
+        Ok(p, "Path saved (" + std::to_string(pts.size()) + " points)");
+        Send(p, Join("PC", 0));
+        SendInfo(p, c);
+    }
+
+    void OpPathDelete(Player* p, Creature* c)
+    {
+        uint32 path = c->GetWaypointPath();
+        SaveAddon(c->GetSpawnId(), 0, 0, true, false);
+        if (path == c->GetSpawnId() * 10)
+            WorldDatabase.DirectExecute("DELETE FROM waypoint_data WHERE id = {}", path);
+        c->LoadPath(0);
+        c->SetDefaultMovementType(IDLE_MOTION_TYPE);
+        RestartMovement(c);
+        c->SaveToDB();
+        Ok(p, "Path removed, NPC stands still");
+        SendInfo(p, c);
+    }
+
+    // ================================================================ v2: generic table editor, quests, objects
+    constexpr uint32 QUEST_FIRST = 9990001, QUEST_LAST = 9999999;
+    constexpr uint32 GOTPL_FIRST = 9980001, GOTPL_LAST = 9989999;
+    constexpr uint32 ESCORT_WP_BASE = 99800000;
+
+    std::unordered_map<ObjectGuid::LowType, std::string> g_buf;   // long text arrives in chunks
+    std::set<std::string> g_dirty;                                 // tables written since the last RLOAD
+
+    // tables the editor may touch, with the column that identifies a record / a list
+    std::unordered_map<std::string, std::string> const& RowTables()
+    {
+        static std::unordered_map<std::string, std::string> const t = {
+            { "quest_template", "ID" }, { "quest_template_addon", "ID" }, { "quest_offer_reward", "ID" },
+            { "quest_request_items", "ID" }, { "npc_text", "ID" }, { "trainer", "Id" }, { "gameobject_template", "entry" },
+            { "npc_vendor", "entry" }, { "trainer_spell", "TrainerId" }, { "creature_default_trainer", "CreatureId" },
+            { "gossip_menu", "MenuID" }, { "gossip_menu_option", "MenuID" }, { "creature_queststarter", "id" },
+            { "creature_questender", "id" },
+        };
+        return t;
+    }
+
+    std::set<std::string> const& Columns(std::string const& table)
+    {
+        static std::unordered_map<std::string, std::set<std::string>> cache;
+        auto itr = cache.find(table);
+        if (itr != cache.end())
+            return itr->second;
+        std::set<std::string>& cols = cache[table];
+        if (QueryResult r = WorldDatabase.Query("SHOW COLUMNS FROM `{}`", table))
+            do { cols.insert(r->Fetch()[0].Get<std::string>()); } while (r->NextRow());
+        return cols;
+    }
+
+    bool ValidTable(Player* p, std::string const& t)
+    {
+        if (RowTables().count(t))
+            return true;
+        Err(p, "Table not editable: " + Clean(t, 40));
+        return false;
+    }
+
+    bool ValidColumn(Player* p, std::string const& t, std::string const& c)
+    {
+        if (Columns(t).count(c))
+            return true;
+        Err(p, "Unknown column " + Clean(c, 40) + " in " + t);
+        return false;
+    }
+
+    std::string Esc(std::string s)
+    {
+        WorldDatabase.EscapeString(s);
+        return s;
+    }
+
+    void ReloadTables(Player* p)
+    {
+        auto has = [](std::initializer_list<char const*> l) { for (char const* t : l) if (g_dirty.count(t)) return true; return false; };
+        if (has({ "quest_template", "quest_template_addon", "quest_offer_reward", "quest_request_items" }))
+        {
+            sObjectMgr->LoadQuests();
+            sObjectMgr->LoadGameObjectForQuests();
+            sObjectMgr->LoadQuestStartersAndEnders();
+        }
+        else if (has({ "creature_queststarter", "creature_questender" }))
+            sObjectMgr->LoadQuestStartersAndEnders();
+        if (has({ "npc_text" })) sObjectMgr->LoadGossipText();
+        if (has({ "gossip_menu" })) sObjectMgr->LoadGossipMenu();
+        if (has({ "gossip_menu_option" })) sObjectMgr->LoadGossipMenuItems();
+        if (has({ "npc_vendor" })) sObjectMgr->LoadVendors();
+        if (has({ "trainer", "trainer_spell", "creature_default_trainer" }))
+        {
+            sObjectMgr->LoadTrainers();
+            sObjectMgr->LoadCreatureDefaultTrainers();
+        }
+        bool goTpl = g_dirty.count("gameobject_template") != 0;
+        g_dirty.clear();
+        Ok(p, goTpl ? "Saved. Object type changes show after a restart" : "Saved and applied live");
+    }
+
+    // RGET~table~key : every column of one record, long values split in chunks
+    void OpRGet(Player* p, std::vector<std::string> const& a)
+    {
+        std::string t = S(a, 2);
+        if (!ValidTable(p, t))
+            return;
+        uint32 key = U(a, 3);
+        std::string const& kc = RowTables().at(t);
+        Send(p, Join("RH", t, key));
+        if (QueryResult r = WorldDatabase.Query("SELECT * FROM `{}` WHERE `{}` = {} LIMIT 1", t, kc, key))
+        {
+            Field* f = r->Fetch();
+            for (uint32 i = 0; i < r->GetFieldCount(); ++i)
+            {
+                std::string col = r->GetFieldName(i);
+                std::string v = f[i].IsNull() ? std::string() : f[i].Get<std::string>();
+                for (char& c : v)
+                    if (c == '~' || c == '\t' || c == '|' || c == '\r') c = ' ';
+                    else if (c == '\n') c = '\x01';
+                std::string out;
+                for (char c : v) { if (c == '\x01') out += "$B"; else out += c; }
+                if (out.empty())
+                    Send(p, Join("RR", col, 0, ""));
+                for (size_t o = 0, n = 0; o < out.size(); o += 180, ++n)
+                    Send(p, Join("RR", col, n, out.substr(o, 180)));
+            }
+        }
+        Send(p, Join("RX", t, key));
+    }
+
+    // RSET~table~key~column : value = text buffer (BUF chunks). Creates the record when missing.
+    void OpRSet(Player* p, std::vector<std::string> const& a)
+    {
+        std::string t = S(a, 2), col = S(a, 4);
+        uint32 key = U(a, 3);
+        if (!ValidTable(p, t) || !ValidColumn(p, t, col))
+            return;
+        std::string const& kc = RowTables().at(t);
+        if (col == kc)
+            return Err(p, "The id column can't be changed");
+        std::string& v = g_buf[p->GetGUID().GetCounter()];
+        WorldDatabase.DirectExecute("INSERT IGNORE INTO `{}` (`{}`) VALUES ({})", t, kc, key);
+        WorldDatabase.DirectExecute("UPDATE `{}` SET `{}` = '{}' WHERE `{}` = {}", t, col, Esc(v), kc, key);
+        v.clear();
+        g_dirty.insert(t);
+    }
+
+    std::string RowName(std::string const& col, uint32 id)
+    {
+        if (col == "item")
+            if (ItemTemplate const* it = sObjectMgr->GetItemTemplate(id)) return it->Name1;
+        if (col == "SpellId")
+            if (SpellEntry const* s = sSpellStore.LookupEntry(id)) return s->SpellName[0];
+        if (col == "quest")
+            if (Quest const* q = sObjectMgr->GetQuestTemplate(id)) return q->GetTitle();
+        return "";
+    }
+
+    // LGET~table~listKey : all rows of a list table (vendor items, trainer spells, gossip options, quest givers)
+    void OpLGet(Player* p, std::vector<std::string> const& a)
+    {
+        std::string t = S(a, 2);
+        if (!ValidTable(p, t))
+            return;
+        uint32 key = U(a, 3);
+        Send(p, Join("LH", t, key));
+        if (QueryResult r = WorldDatabase.Query("SELECT * FROM `{}` WHERE `{}` = {} LIMIT 200", t, RowTables().at(t), key))
+        {
+            do
+            {
+                Field* f = r->Fetch();
+                std::string line = "LR~" + t;
+                std::string name;
+                for (uint32 i = 0; i < r->GetFieldCount(); ++i)
+                {
+                    std::string col = r->GetFieldName(i);
+                    if (col == "VerifiedBuild")
+                        continue;
+                    std::string v = f[i].IsNull() ? std::string() : Clean(f[i].Get<std::string>(), 60);
+                    line += "~" + col + "=" + v;
+                    if (name.empty() && !v.empty())
+                        name = RowName(col, uint32(std::strtoul(v.c_str(), nullptr, 10)));
+                }
+                Send(p, line + "~_name=" + Clean(name, 50));
+            } while (r->NextRow());
+        }
+        Send(p, Join("LE", t, key));
+    }
+
+    // LADD / LDEL ~table~col=val~col=val... : insert a row / delete matching rows
+    void OpLRow(Player* p, std::vector<std::string> const& a, bool add)
+    {
+        std::string t = S(a, 2);
+        if (!ValidTable(p, t))
+            return;
+        std::string cols, vals, where;
+        bool hasKey = false;
+        for (size_t i = 3; i < a.size(); ++i)
+        {
+            size_t eq = a[i].find('=');
+            if (eq == std::string::npos)
+                continue;
+            std::string c = a[i].substr(0, eq), v = a[i].substr(eq + 1);
+            if (!ValidColumn(p, t, c))
+                return;
+            hasKey |= c == RowTables().at(t);
+            cols += (cols.empty() ? "`" : ",`") + c + "`";
+            vals += (vals.empty() ? "'" : ",'") + Esc(v) + "'";
+            where += (where.empty() ? "`" : " AND `") + c + "` = '" + Esc(v) + "'";
+        }
+        if (!hasKey)
+            return Err(p, "Missing " + RowTables().at(t));
+        if (add)
+            WorldDatabase.DirectExecute("REPLACE INTO `{}` ({}) VALUES ({})", t, cols, vals);
+        else
+            WorldDatabase.DirectExecute("DELETE FROM `{}` WHERE {}", t, where);
+        g_dirty.insert(t);
+    }
+
+    uint32 NextFree(char const* table, char const* col, uint32 first, uint32 last)
+    {
+        uint32 id = first;
+        if (QueryResult r = WorldDatabase.Query("SELECT MAX(`{}`) FROM `{}` WHERE `{}` BETWEEN {} AND {}", col, table, col, first, last))
+            if (!r->Fetch()[0].IsNull())
+                id = r->Fetch()[0].Get<uint32>() + 1;
+        return id <= last ? id : 0;
+    }
+
+    // NEWID~kind : a free id in the dev range (npc_text, gossip menu, trainer)
+    void OpNewId(Player* p, std::vector<std::string> const& a)
+    {
+        std::string k = S(a, 2);
+        uint32 id = 0;
+        if (k == "npc_text") id = NextFree("npc_text", "ID", 16000001, 16099999);
+        else if (k == "gossip") id = std::max(NextFree("gossip_menu", "MenuID", 9998001, 9998999), NextFree("gossip_menu_option", "MenuID", 9998001, 9998999));
+        else if (k == "trainer") id = NextFree("trainer", "Id", 9980001, 9989999);
+        if (!id)
+            return Err(p, "No free id left");
+        Send(p, Join("NI", k, id));
+    }
+
+    // ---------------------------------------------------------------- quests
+    void OpQSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 qid = U(a, 2);
+        std::vector<Quest const*> hits;
+        for (auto const& [id, quest] : sObjectMgr->GetQuestTemplates())
+        {
+            bool dev = id >= QUEST_FIRST && id <= QUEST_LAST;
+            if (q.empty() ? !dev : (id != qid && Lower(quest->GetTitle()).find(q) == std::string::npos))
+                continue;
+            hits.push_back(quest);
+            if (hits.size() >= 300)
+                break;
+        }
+        std::sort(hits.begin(), hits.end(), [](Quest const* x, Quest const* y) { return x->GetQuestId() > y->GetQuestId(); });
+        Send(p, Join("QB", uint32(hits.size())));
+        for (Quest const* quest : hits)
+            Send(p, Join("QR", quest->GetQuestId(), quest->GetQuestLevel(), Clean(quest->GetTitle(), 70)));
+        Send(p, Join("QE", uint32(hits.size())));
+    }
+
+    // QNEW~title~guid(optional): new quest, given and finished by that NPC
+    void OpQNew(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 id = NextFree("quest_template", "ID", QUEST_FIRST, QUEST_LAST);
+        if (!id)
+            return Err(p, "No free quest id left");
+        std::string title = S(a, 2).empty() ? "New quest" : S(a, 2);
+        uint32 level = p->GetLevel();
+        if (Creature* c = U(a, 3) ? FindSpawn(p, U(a, 3)) : nullptr)
+        {
+            level = c->GetLevel();
+            WorldDatabase.DirectExecute("REPLACE INTO creature_queststarter (id, quest) VALUES ({}, {})", c->GetEntry(), id);
+            WorldDatabase.DirectExecute("REPLACE INTO creature_questender (id, quest) VALUES ({}, {})", c->GetEntry(), id);
+            if (!c->HasNpcFlag(UNIT_NPC_FLAG_QUESTGIVER))
+            {
+                c->SetNpcFlag(UNIT_NPC_FLAG_QUESTGIVER);
+                c->SaveToDB();
+            }
+        }
+        WorldDatabase.DirectExecute("INSERT INTO quest_template (ID, QuestType, QuestLevel, MinLevel, LogTitle, LogDescription, QuestDescription, RewardXPDifficulty) "
+            "VALUES ({}, 2, {}, {}, '{}', 'Objectives go here.', 'Quest text goes here.', 5)", id, level, std::max<uint32>(1, level > 3 ? level - 3 : 1), Esc(title));
+        WorldDatabase.DirectExecute("INSERT IGNORE INTO quest_offer_reward (ID, RewardText) VALUES ({}, 'Well done.')", id);
+        WorldDatabase.DirectExecute("INSERT IGNORE INTO quest_request_items (ID, CompletionText) VALUES ({}, 'Is it done?')", id);
+        WorldDatabase.DirectExecute("INSERT IGNORE INTO quest_template_addon (ID) VALUES ({})", id);
+        g_dirty.insert("quest_template");
+        ReloadTables(p);
+        Send(p, Join("QN", id));
+    }
+
+    void OpQDel(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 id = U(a, 2);
+        if (id < QUEST_FIRST || id > QUEST_LAST)
+            return Err(p, "Only quests made with the dev menu can be deleted");
+        for (char const* t : { "quest_template", "quest_template_addon", "quest_offer_reward", "quest_request_items" })
+            WorldDatabase.DirectExecute("DELETE FROM `{}` WHERE ID = {}", t, id);
+        WorldDatabase.DirectExecute("DELETE FROM creature_queststarter WHERE quest = {}", id);
+        WorldDatabase.DirectExecute("DELETE FROM creature_questender WHERE quest = {}", id);
+        g_dirty.insert("quest_template");
+        ReloadTables(p);
+    }
+
+    // QESCORT~quest~guid~run : the NPC walks the path you recorded in the path editor when the quest is accepted;
+    // the quest completes for the escorting players when it reaches the end.
+    void OpQEscort(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 quest = U(a, 2);
+        Creature* c = FindSpawn(p, U(a, 3));
+        if (!c || !sObjectMgr->GetQuestTemplate(quest))
+            return Err(p, "Select the NPC and save the quest first");
+        EditState& st = g_state[p->GetGUID().GetCounter()];
+        if (st.path.size() < 2)
+            return Err(p, "Record at least 2 points in the Path editor first (Add point here)");
+        uint32 wp = ESCORT_WP_BASE + quest % 100000;
+        WorldDatabase.DirectExecute("DELETE FROM waypoints WHERE entry = {}", wp);
+        for (size_t i = 0; i < st.path.size(); ++i)
+            WorldDatabase.DirectExecute("INSERT INTO waypoints (entry, pointid, position_x, position_y, position_z, point_comment) VALUES ({}, {}, {}, {}, {}, 'dev menu escort')",
+                wp, uint32(i + 1), st.path[i].GetPositionX(), st.path[i].GetPositionY(), st.path[i].GetPositionZ());
+        int64 eog = -int64(c->GetSpawnId());
+        WorldDatabase.DirectExecute("DELETE FROM smart_scripts WHERE entryorguid = {} AND source_type = 0 AND event_type = 19 AND event_param1 = {}", eog, quest);
+        uint32 sid = 0;
+        if (QueryResult r = WorldDatabase.Query("SELECT MAX(id) FROM smart_scripts WHERE entryorguid = {} AND source_type = 0", eog))
+            if (!r->Fetch()[0].IsNull())
+                sid = r->Fetch()[0].Get<uint32>() + 1;
+        WorldDatabase.DirectExecute("INSERT INTO smart_scripts (entryorguid, source_type, id, link, event_type, event_param1, action_type, action_param1, action_param2, action_param3, action_param4, action_param5, action_param6, target_type, comment) "
+            "VALUES ({}, 0, {}, 0, 19, {}, 53, {}, {}, 0, {}, 15000, 1, 7, 'dev menu: escort on quest accept')", eog, sid, quest, U(a, 4) ? 2 : 1, wp, quest);
+        WorldDatabase.DirectExecute("INSERT IGNORE INTO quest_template_addon (ID) VALUES ({})", quest);
+        WorldDatabase.DirectExecute("UPDATE quest_template_addon SET SpecialFlags = SpecialFlags | 2 WHERE ID = {}", quest);
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        if (ct->AIName != "SmartAI")
+        {
+            if (ct->ScriptID)
+                Ok(p, "Note: this NPC type had a C++ script, it now uses SmartAI");
+            ct->AIName = "SmartAI";
+            WorldDatabase.DirectExecute("UPDATE creature_template SET AIName = 'SmartAI' WHERE entry = {}", ct->Entry);
+        }
+        sSmartWaypointMgr->LoadFromDB();
+        sSmartScriptMgr->LoadSmartAIFromDB();
+        g_dirty.insert("quest_template");
+        ReloadTables(p);
+        c->AIM_Initialize();
+        st.path.clear();
+        ClearMarkers(p, st);
+        Send(p, Join("PC", 0));
+        Ok(p, "Escort saved: the NPC walks the path when the quest is accepted");
+    }
+
+    // ---------------------------------------------------------------- vendor price & currency
+    // Gold price is the item's own BuyPrice (the 3.3.5 client shows that for every vendor, no per-vendor price exists).
+    // Currencies are the server's ItemExtendedCost entries (badges, emblems, honor, arena points...).
+    std::string ExtCostText(ItemExtendedCostEntry const* e)
+    {
+        std::string t;
+        for (uint8 i = 0; i < MAX_ITEM_EXTENDED_COST_REQUIREMENTS; ++i)
+            if (e->reqitem[i] && e->reqitemcount[i])
+            {
+                ItemTemplate const* it = sObjectMgr->GetItemTemplate(e->reqitem[i]);
+                t += (t.empty() ? "" : " + ") + std::to_string(e->reqitemcount[i]) + "x " + (it ? it->Name1 : "item " + std::to_string(e->reqitem[i]));
+            }
+        if (e->reqhonorpoints)
+            t += (t.empty() ? "" : " + ") + std::to_string(e->reqhonorpoints) + " honor";
+        if (e->reqarenapoints)
+            t += (t.empty() ? "" : " + ") + std::to_string(e->reqarenapoints) + " arena points";
+        if (e->reqpersonalarenarating)
+            t += " (rating " + std::to_string(e->reqpersonalarenarating) + ")";
+        return Clean(t.empty() ? "nothing" : t, 120);
+    }
+
+    // a[2] text: currency name ("emblem", "honor") or an extended cost id
+    void OpExtCostSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 asId = uint32(std::strtoul(q.c_str(), nullptr, 10));
+        uint32 shown = 0;
+        Send(p, Join("XCB", 0));
+        for (uint32 i = 1; i < sItemExtendedCostStore.GetNumRows() && shown < 60; ++i)
+        {
+            ItemExtendedCostEntry const* e = sItemExtendedCostStore.LookupEntry(i);
+            if (!e)
+                continue;
+            std::string t = ExtCostText(e);
+            if (asId ? i != asId : (q.empty() || Lower(t).find(q) == std::string::npos))
+                continue;
+            Send(p, Join("XC", i, t));
+            ++shown;
+        }
+        Send(p, Join("XCE", shown));
+    }
+
+    // a[2] item, a[3] price in copper (optional: only reports when missing)
+    void OpItemPrice(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 item = U(a, 2);
+        ItemTemplate* it = const_cast<ItemTemplate*>(sObjectMgr->GetItemTemplate(item));
+        if (!it)
+            return Err(p, "No item with that id");
+        if (a.size() > 3 && !a[3].empty())
+        {
+            it->BuyPrice = U(a, 3);
+            WorldDatabase.DirectExecute("UPDATE item_template SET BuyPrice = {} WHERE entry = {}", it->BuyPrice, item);
+            Ok(p, "Price saved for " + Clean(it->Name1, 40) + " (every vendor that sells it)");
+        }
+        Send(p, Join("IP", item, it->BuyPrice));
+    }
+
+    // a[2] vendor entry, a[3] item, a[4] old extended cost, a[5] new extended cost (0 = gold only)
+    void OpVendorCurrency(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 entry = U(a, 2), item = U(a, 3), oldCost = U(a, 4), cost = U(a, 5);
+        if (cost && !sItemExtendedCostStore.LookupEntry(cost))
+            return Err(p, "No currency entry with that id");
+        WorldDatabase.DirectExecute("UPDATE npc_vendor SET ExtendedCost = {} WHERE entry = {} AND item = {} AND ExtendedCost = {}", cost, entry, item, oldCost);
+        g_dirty.insert("npc_vendor");
+        ReloadTables(p);
+        if (cost)
+            Ok(p, "Now costs " + ExtCostText(sItemExtendedCostStore.LookupEntry(cost)) + " (no gold)");
+        else
+            Ok(p, "Now costs gold only");
+    }
+
+    // ---------------------------------------------------------------- combat (SmartAI rows on the NPC type)
+    std::string SpellLabel(uint32 id)
+    {
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(id);
+        if (!si || !si->SpellName[0])
+            return "?";
+        std::string n = si->SpellName[0];
+        if (si->Rank[0] && *si->Rank[0])
+            n += std::string(" (") + si->Rank[0] + ")";
+        return Clean(n, 60);
+    }
+
+    void SendSpellRow(Player* p, uint32 id)
+    {
+        SpellInfo const* si = sSpellMgr->GetSpellInfo(id);
+        if (!si)
+            return;
+        Send(p, Join("SP", id, SpellLabel(id), si->CalcCastTime(), uint32(si->GetMaxRange(false)), si->SpellIconID));
+    }
+
+    // text search over every spell the server knows, "npc:<entry>" lists what another mob casts
+    void OpSpellSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 page = U(a, 3), shown = 0, total = 0;
+        Send(p, Join("SPB", page));
+        if (q.rfind("npc:", 0) == 0)
+        {
+            uint32 entry = uint32(std::strtoul(q.c_str() + 4, nullptr, 10));
+            std::set<uint32> ids;
+            if (CreatureTemplate const* ct = sObjectMgr->GetCreatureTemplate(entry))
+                for (uint32 s : ct->spells)
+                    if (s) ids.insert(s);
+            if (QueryResult r = WorldDatabase.Query("SELECT DISTINCT action_param1 FROM smart_scripts WHERE entryorguid = {} AND source_type = 0 AND action_type = 11", entry))
+                do ids.insert(r->Fetch()[0].Get<uint32>()); while (r->NextRow());
+            for (uint32 s : ids)
+                if (sSpellMgr->GetSpellInfo(s) && total++ >= page * 30 && shown < 30) { SendSpellRow(p, s); ++shown; }
+            return Send(p, Join("SPE", total));
+        }
+        uint32 asId = uint32(std::strtoul(q.c_str(), nullptr, 10));
+        for (uint32 i = 1; i < sSpellMgr->GetSpellInfoStoreSize(); ++i)
+        {
+            SpellInfo const* si = sSpellMgr->GetSpellInfo(i);
+            if (!si || !si->SpellName[0] || !*si->SpellName[0])
+                continue;
+            if (asId ? i != asId : Lower(si->SpellName[0]).find(q) == std::string::npos)
+                continue;
+            if (total++ >= page * 30 && shown < 30) { SendSpellRow(p, i); ++shown; }
+        }
+        Send(p, Join("SPE", total));
+    }
+
+    void SendCombat(Player* p, Creature* c)
+    {
+        CreatureTemplate const* ct = c->GetCreatureTemplate();
+        Send(p, Join("CB", c->GetSpawnId(), uint32(c->GetWeaponDamageRange(BASE_ATTACK, MINDAMAGE)), uint32(c->GetWeaponDamageRange(BASE_ATTACK, MAXDAMAGE)),
+            ct->BaseAttackTime, ct->DamageModifier, ct->AIName == "SmartAI" ? 1 : (ct->ScriptID ? 2 : 0)));
+        if (QueryResult r = WorldDatabase.Query("SELECT id, action_param1, event_param3, event_param4, event_param1, target_type, event_chance FROM smart_scripts "
+            "WHERE entryorguid = {} AND source_type = 0 AND event_type = 0 AND action_type = 11 ORDER BY id", c->GetEntry()))
+            do
+            {
+                Field* f = r->Fetch();
+                Send(p, Join("CS", f[0].Get<uint32>(), f[1].Get<uint32>(), SpellLabel(f[1].Get<uint32>()), f[2].Get<uint32>(), f[3].Get<uint32>(), f[4].Get<uint32>(), uint32(f[5].Get<uint8>()), uint32(f[6].Get<uint8>())));
+            } while (r->NextRow());
+        Send(p, Join("CE", c->GetSpawnId()));
+    }
+
+    void ReloadSmart(Player* p, Creature* c)
+    {
+        CreatureTemplate* ct = MutableTemplate(c->GetEntry());
+        if (ct->AIName != "SmartAI")
+        {
+            if (ct->ScriptID)
+                Ok(p, "Note: this NPC type had a C++ script, it now uses SmartAI");
+            ct->AIName = "SmartAI";
+            WorldDatabase.DirectExecute("UPDATE creature_template SET AIName = 'SmartAI' WHERE entry = {}", ct->Entry);
+        }
+        sSmartScriptMgr->LoadSmartAIFromDB();
+        // every loaded copy of this type on the map switches now; fighting ones after their fight (they respawn with it too)
+        uint32 const entry = c->GetEntry();
+        for (auto const& [spawnId, other] : c->GetMap()->GetCreatureBySpawnIdStore())
+            if (other && other->GetEntry() == entry && other->IsAlive() && !other->IsInCombat())
+                other->AIM_Initialize();
+    }
+
+    // a[3] spell, a[4] first cast after (ms), a[5] repeat min, a[6] repeat max, a[7] target (2 victim, 1 self, 5 random enemy), a[8] chance
+    void OpCombatAdd(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        uint32 spell = U(a, 3);
+        if (!sSpellMgr->GetSpellInfo(spell))
+            return Err(p, "No spell with that id on this server");
+        uint32 first = U(a, 4, 2000), rmin = std::max<uint32>(U(a, 5, 8000), 500), rmax = std::max(U(a, 6, rmin), rmin);
+        uint32 tgt = U(a, 7, 2);
+        if (tgt != 1 && tgt != 2 && tgt != 5)
+            tgt = 2;
+        uint32 chance = std::clamp<uint32>(U(a, 8, 100), 1, 100);
+        uint32 sid = 0;
+        if (QueryResult r = WorldDatabase.Query("SELECT MAX(id) FROM smart_scripts WHERE entryorguid = {} AND source_type = 0", c->GetEntry()))
+            if (!r->Fetch()[0].IsNull())
+                sid = r->Fetch()[0].Get<uint32>() + 1;
+        WorldDatabase.DirectExecute("INSERT INTO smart_scripts (entryorguid, source_type, id, link, event_type, event_chance, event_param1, event_param2, event_param3, event_param4, action_type, action_param1, target_type, comment) "
+            "VALUES ({}, 0, {}, 0, 0, {}, {}, {}, {}, {}, 11, {}, {}, 'dev menu: combat spell')", c->GetEntry(), sid, chance, first, first, rmin, rmax, spell, tgt);
+        ReloadSmart(p, c);
+        SendCombat(p, c);
+        Ok(p, "Added " + SpellLabel(spell) + " (every NPC of this type)");
+    }
+
+    void OpCombatDel(Player* p, Creature* c, std::vector<std::string> const& a)
+    {
+        WorldDatabase.DirectExecute("DELETE FROM smart_scripts WHERE entryorguid = {} AND source_type = 0 AND id = {} AND event_type = 0 AND action_type = 11", c->GetEntry(), U(a, 3));
+        ReloadSmart(p, c);
+        SendCombat(p, c);
+    }
+
+    // ---------------------------------------------------------------- objects
+    std::string ModelPath(uint32 display)
+    {
+        if (GameObjectDisplayInfoEntry const* d = sGameObjectDisplayInfoStore.LookupEntry(display))
+            if (d->filename)
+                return Clean(d->filename, 150);
+        return "";
+    }
+
+    void OpGSearch(Player* p, std::vector<std::string> const& a)
+    {
+        std::string q = Lower(S(a, 2));
+        uint32 page = U(a, 3), mode = U(a, 4);   // mode 0 object types, 1 raw models (every asset)
+        uint32 qid = uint32(std::strtoul(q.c_str(), nullptr, 10));
+        struct Hit { uint32 entry, type, display; std::string name; };
+        std::vector<Hit> hits;
+        if (mode == 0)
+        {
+            for (auto const& [entry, gt] : *sObjectMgr->GetGameObjectTemplates())
+                if (q.empty() || entry == qid || Lower(gt.name).find(q) != std::string::npos)
+                    hits.push_back({ entry, gt.type, gt.displayId, gt.name });
+        }
+        else
+        {
+            for (uint32 i = 0; i < sGameObjectDisplayInfoStore.GetNumRows(); ++i)
+                if (GameObjectDisplayInfoEntry const* d = sGameObjectDisplayInfoStore.LookupEntry(i))
+                    if (d->filename && (q.empty() || i == qid || Lower(d->filename).find(q) != std::string::npos))
+                    {
+                        std::string f = d->filename;
+                        size_t s = f.find_last_of("\\/");
+                        hits.push_back({ 0, 0, i, s == std::string::npos ? f : f.substr(s + 1) });
+                    }
+        }
+        std::sort(hits.begin(), hits.end(), [&](Hit const& x, Hit const& y)
+        {
+            bool xe = (x.entry ? x.entry : x.display) == qid, ye = (y.entry ? y.entry : y.display) == qid;
+            if (xe != ye) return xe;
+            return x.name != y.name ? x.name < y.name : x.display < y.display;
+        });
+        uint32 total = uint32(hits.size());
+        uint32 pages = std::max<uint32>(1, (total + PAGE_SIZE - 1) / PAGE_SIZE);
+        page = std::min(page, pages - 1);
+        Send(p, Join("GB", total, page, pages));
+        for (uint32 i = page * PAGE_SIZE; i < std::min(total, (page + 1) * PAGE_SIZE); ++i)
+            Send(p, Join("GR", hits[i].entry, Clean(hits[i].name, 60), hits[i].type, hits[i].display, ModelPath(hits[i].display)));
+        Send(p, Join("GE", total, page, pages));
+    }
+
+    // a generic (decoration) object type for a raw model, made once per model
+    uint32 TemplateForDisplay(Player* p, uint32 display)
+    {
+        for (auto const& [entry, gt] : *sObjectMgr->GetGameObjectTemplates())
+            if (entry >= GOTPL_FIRST && entry <= GOTPL_LAST && gt.displayId == display)
+                return entry;
+        uint32 id = NextFree("gameobject_template", "entry", GOTPL_FIRST, GOTPL_LAST);
+        if (!id)
+        {
+            Err(p, "No free object id left");
+            return 0;
+        }
+        std::string f = ModelPath(display);
+        size_t s = f.find_last_of("\\/");
+        std::string name = s == std::string::npos ? f : f.substr(s + 1);
+        if (name.size() > 4) name.resize(name.size() - 4);
+        WorldDatabase.DirectExecute("INSERT INTO gameobject_template (entry, type, displayId, name, size) VALUES ({}, 5, {}, '{}', 1)", id, display, Esc(name));
+        GameObjectTemplate& gt = (*const_cast<GameObjectTemplateContainer*>(sObjectMgr->GetGameObjectTemplates()))[id];
+        gt = GameObjectTemplate();
+        gt.entry = id;
+        gt.type = GAMEOBJECT_TYPE_GENERIC;
+        gt.displayId = display;
+        gt.name = name;
+        gt.size = 1.f;
+        return id;
+    }
+
+    GameObject* FindGo(Player* p, ObjectGuid::LowType guid)
+    {
+        auto bounds = p->GetMap()->GetGameObjectBySpawnIdStore().equal_range(guid);
+        return bounds.first != bounds.second ? bounds.first->second : nullptr;
+    }
+
+    void SendGoInfo(Player* p, GameObject* go)
+    {
+        float yaw = 0, pitch = 0, roll = 0;
+        if (GameObjectData const* d = go->GetGameObjectData())
+            G3D::Matrix3(d->rotation).toEulerAnglesZYX(yaw, pitch, roll);
+        GameObjectTemplate const* gt = go->GetGOInfo();
+        Send(p, Join("GI", go->GetSpawnId(), go->GetEntry(), Clean(gt->name, 60), go->GetPositionX(), go->GetPositionY(), go->GetPositionZ(),
+            go->GetOrientation(), yaw * 180.f / float(M_PI), pitch * 180.f / float(M_PI), roll * 180.f / float(M_PI), gt->displayId, gt->type, ModelPath(gt->displayId)));
+    }
+
+    // rewrite position/rotation and respawn the object fresh (the 3.3.5 client ignores updates of a known guid)
+    GameObject* GoPlace(Player* p, GameObject* go, float x, float y, float z, float yaw, float pitch, float roll)
+    {
+        ObjectGuid::LowType guid = go->GetSpawnId();
+        Map* map = go->GetMap();
+        sObjectMgr->RemoveGameobjectFromGrid(guid, go->GetGameObjectData());
+        go->Relocate(x, y, z, yaw);
+        go->SetWorldRotationAngles(yaw, pitch, roll);
+        go->SaveToDB();
+        sObjectMgr->AddGameobjectToGrid(guid, go->GetGameObjectData());
+        go->Delete();
+        GameObject* ngo = new GameObject();
+        if (!ngo->LoadGameObjectFromDB(guid, map, true))
+        {
+            delete ngo;
+            Err(p, "Object saved but could not respawn");
+            return nullptr;
+        }
+        SendGoInfo(p, ngo);
+        return ngo;
+    }
+
+    void OpGSpawn(Player* p, std::vector<std::string> const& a)
+    {
+        uint32 entry = U(a, 2);
+        if (U(a, 3))   // spawn by raw model id
+            entry = TemplateForDisplay(p, U(a, 3));
+        GameObjectTemplate const* gt = entry ? sObjectMgr->GetGameObjectTemplate(entry) : nullptr;
+        if (!gt)
+            return Err(p, "Unknown object");
+        if (gt->displayId && !sGameObjectDisplayInfoStore.LookupEntry(gt->displayId))
+            return Err(p, "That object has a missing model");
+        Map* map = p->GetMap();
+        GameObject* go = sObjectMgr->IsGameObjectStaticTransport(entry) ? new StaticTransport() : new GameObject();
+        float o = p->GetOrientation();
+        G3D::Quat rot = G3D::Quat::fromAxisAngleRotation(G3D::Vector3::unitZ(), o);
+        if (!go->Create(map->GenerateLowGuid<HighGuid::GameObject>(), entry, map, p->GetPhaseMaskForSpawn(), p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), o, rot, 0, GO_STATE_READY))
+        {
+            delete go;
+            return Err(p, "Could not create the object here");
+        }
+        go->SaveToDB(map->GetId(), (1 << map->GetSpawnMode()), p->GetPhaseMaskForSpawn());
+        ObjectGuid::LowType guid = go->GetSpawnId();
+        delete go;
+        go = sObjectMgr->IsGameObjectStaticTransport(entry) ? new StaticTransport() : new GameObject();
+        if (!go->LoadGameObjectFromDB(guid, map, true))
+        {
+            delete go;
+            return Err(p, "Saved but could not load");
+        }
+        sObjectMgr->AddGameobjectToGrid(guid, sObjectMgr->GetGameObjectData(guid));
+        Ok(p, "Object placed and saved");
+        SendGoInfo(p, go);
+    }
+
+    void OpGNear(Player* p, std::vector<std::string> const& a)
+    {
+        float r = std::min(200.f, std::max(5.f, F(a, 2, 40.f)));
+        Send(p, Join("GNB", 0));
+        if (QueryResult q = WorldDatabase.Query("SELECT guid, id, SQRT(POW(position_x - {0}, 2) + POW(position_y - {1}, 2) + POW(position_z - {2}, 2)) AS d FROM gameobject "
+            "WHERE map = {3} AND position_x BETWEEN {0} - {4} AND {0} + {4} AND position_y BETWEEN {1} - {4} AND {1} + {4} ORDER BY d LIMIT 60",
+            p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), p->GetMapId(), r))
+        {
+            do
+            {
+                Field* f = q->Fetch();
+                GameObjectTemplate const* gt = sObjectMgr->GetGameObjectTemplate(f[1].Get<uint32>());
+                Send(p, Join("GN", f[0].Get<uint32>(), f[1].Get<uint32>(), Clean(gt ? gt->name : "?", 60), f[2].Get<float>()));
+            } while (q->NextRow());
+        }
+        Send(p, Join("GNE", 0));
+    }
+
+    void GoOps(Player* p, std::string const& op, std::vector<std::string> const& a)
+    {
+        GameObject* go = nullptr;
+        if (op == "GPICK" && !S(a, 2).empty())
+        {
+            // the object the player clicked: nearest saved object with the tooltip's name
+            std::string want = Lower(S(a, 2));
+            float best = 60.f;
+            if (QueryResult q = WorldDatabase.Query("SELECT guid FROM gameobject WHERE map = {} AND position_x BETWEEN {} AND {} AND position_y BETWEEN {} AND {}",
+                p->GetMapId(), p->GetPositionX() - 60, p->GetPositionX() + 60, p->GetPositionY() - 60, p->GetPositionY() + 60))
+                do
+                {
+                    if (GameObject* g = FindGo(p, q->Fetch()[0].Get<uint32>()))
+                        if (Lower(g->GetGOInfo()->name) == want && p->GetDistance(g) < best) { best = p->GetDistance(g); go = g; }
+                } while (q->NextRow());
+            if (go)
+                return SendGoInfo(p, go);
+        }
+        if (op == "GTGT" || op == "GPICK")
+        {
+            // nearest saved object in front of you
+            float best = 15.f;
+            if (QueryResult q = WorldDatabase.Query("SELECT guid FROM gameobject WHERE map = {} AND position_x BETWEEN {} AND {} AND position_y BETWEEN {} AND {}",
+                p->GetMapId(), p->GetPositionX() - 15, p->GetPositionX() + 15, p->GetPositionY() - 15, p->GetPositionY() + 15))
+                do
+                {
+                    if (GameObject* g = FindGo(p, q->Fetch()[0].Get<uint32>()))
+                    {
+                        float d = p->GetDistance(g) + (p->HasInArc(float(M_PI) / 2, g) ? 0.f : 6.f);
+                        if (d < best) { best = d; go = g; }
+                    }
+                } while (q->NextRow());
+            if (!go)
+                return Err(p, "No saved object within 15 yards");
+            return SendGoInfo(p, go);
+        }
+        go = FindGo(p, U(a, 2));
+        if (!go)
+            return Err(p, "Object not found on your map (move closer?)");
+        float yaw = go->GetOrientation(), pitch = 0, roll = 0;
+        if (GameObjectData const* d = go->GetGameObjectData())
+            G3D::Matrix3(d->rotation).toEulerAnglesZYX(yaw, pitch, roll);
+        float x = go->GetPositionX(), y = go->GetPositionY(), z = go->GetPositionZ();
+        float po = p->GetOrientation();
+        float const R = float(M_PI) / 180.f;
+        if (op == "GSEL") return SendGoInfo(p, go);
+        if (op == "GMOVE") { GoPlace(p, go, p->GetPositionX(), p->GetPositionY(), p->GetPositionZ(), yaw, pitch, roll); return Ok(p, "Moved to you"); }
+        if (op == "GNUDGE")
+        {
+            float fwd = F(a, 3), right = F(a, 4);
+            x += std::cos(po) * fwd + std::cos(po - float(M_PI) / 2) * right;
+            y += std::sin(po) * fwd + std::sin(po - float(M_PI) / 2) * right;
+            GoPlace(p, go, x, y, z + F(a, 5), Position::NormalizeOrientation(yaw + F(a, 6) * R), pitch, roll);
+            return;
+        }
+        if (op == "GNUDGEW") { GoPlace(p, go, x + F(a, 3), y + F(a, 4), z + F(a, 5), yaw, pitch, roll); return; }
+        if (op == "GROT") { GoPlace(p, go, x, y, z, Position::NormalizeOrientation(F(a, 3) * R), F(a, 4) * R, F(a, 5) * R); return; }
+        if (op == "GFACE") { GoPlace(p, go, x, y, z, go->GetAngle(p), pitch, roll); return; }
+        if (op == "GGOTO") { p->NearTeleportTo(x, y, z + 1.f, p->GetOrientation()); return; }
+        if (op == "GDEL")
+        {
+            ObjectGuid::LowType guid = go->GetSpawnId();
+            go->SetRespawnTime(0);
+            go->Delete();
+            go->DeleteFromDB();
+            Ok(p, "Object deleted");
+            return Send(p, Join("GD", guid));
+        }
+        if (op == "GDUP")
+        {
+            std::vector<std::string> b = { "Q", "GSPAWN", std::to_string(go->GetEntry()) };
+            return OpGSpawn(p, b);
+        }
+        Err(p, "Unknown op " + Clean(op, 20));
+    }
+
+    // ================================================================ v3: NPC outfits (player-race NPCs dressed in any armor)
+    // Works on every 3.3.5 client: the NPC uses its race's character model with UNIT_FLAG2_MIRROR_IMAGE,
+    // and the client asks the server for skin/face/hair + armor (SMSG_MIRRORIMAGE_DATA), like Mirror Image.
+    constexpr uint32 OUTFIT_BASE_ENTRY = 68;     // humanoid template copied for brand new NPCs
+    constexpr size_t OUTFIT_ARMOR = 11, OUTFIT_WEAPONS = 3;
+
+    struct Outfit
+    {
+        uint8 race = 1, gender = 0, skin = 0, face = 0, hair = 0, hairColor = 0, facial = 0;
+        int32 armor[OUTFIT_ARMOR] = {};   // item entry (>0) or -display id (<0), 0 = nothing
+        uint32 weapons[OUTFIT_WEAPONS] = {};
+        std::string ext;   // extra looks for custom clients ("key=value,key=value"); stock clients ignore them
+    };
+    std::unordered_map<uint32, Outfit> g_outfits;            // by creature entry
+    std::unordered_map<ObjectGuid, Outfit> g_previews;       // temporary preview NPCs
+    std::unordered_map<ObjectGuid::LowType, ObjectGuid> g_previewOf;   // player -> his preview NPC
+    std::mutex g_outfitLock;
+
+    char const* const ARMOR_COLS[OUTFIT_ARMOR] = { "head", "shoulders", "body", "chest", "waist", "legs", "feet", "wrists", "hands", "back", "tabard" };
+    uint8 const ARMOR_SLOTS[OUTFIT_ARMOR] = { EQUIPMENT_SLOT_HEAD, EQUIPMENT_SLOT_SHOULDERS, EQUIPMENT_SLOT_BODY, EQUIPMENT_SLOT_CHEST, EQUIPMENT_SLOT_WAIST,
+        EQUIPMENT_SLOT_LEGS, EQUIPMENT_SLOT_FEET, EQUIPMENT_SLOT_WRISTS, EQUIPMENT_SLOT_HANDS, EQUIPMENT_SLOT_BACK, EQUIPMENT_SLOT_TABARD };
+    uint8 const WEAPON_SLOTS[OUTFIT_WEAPONS] = { EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND, EQUIPMENT_SLOT_RANGED };
+
+    uint32 RaceModel(Outfit const& o)
+    {
+        if (ChrRacesEntry const* r = sChrRacesStore.LookupEntry(o.race))
+            return o.gender ? r->model_f : r->model_m;
+        return 0;
+    }
+
+    std::string PackOutfit(Outfit const& o)
+    {
+        std::ostringstream ss;
+        ss << uint32(o.race) << ',' << uint32(o.gender) << ',' << uint32(o.skin) << ',' << uint32(o.face) << ',' << uint32(o.hair) << ','
+           << uint32(o.hairColor) << ',' << uint32(o.facial);
+        for (int32 a : o.armor) ss << ',' << a;
+        for (uint32 w : o.weapons) ss << ',' << w;
+        if (!o.ext.empty())
+            ss << ';' << o.ext;
+        return ss.str();
+    }
+
+    bool UnpackOutfit(std::string const& all, Outfit& o)
+    {
+        size_t semi = all.find(';');
+        std::string s = all.substr(0, semi);
+        o.ext.clear();
+        if (semi != std::string::npos)
+            for (char ch : all.substr(semi + 1, 200))   // only safe characters: letters, digits, _ = , - .
+                if (std::isalnum(uint8(ch)) || ch == '_' || ch == '=' || ch == ',' || ch == '-' || ch == '.')
+                    o.ext += ch;
+        std::vector<std::string> v = Split(s, ',');
+        if (v.size() < 7 + OUTFIT_ARMOR + OUTFIT_WEAPONS)
+            return false;
+        auto n = [&](size_t i) { return std::strtol(v[i].c_str(), nullptr, 10); };
+        o.race = uint8(n(0)); o.gender = uint8(n(1) ? 1 : 0); o.skin = uint8(n(2)); o.face = uint8(n(3)); o.hair = uint8(n(4));
+        o.hairColor = uint8(n(5)); o.facial = uint8(n(6));
+        for (size_t i = 0; i < OUTFIT_ARMOR; ++i) o.armor[i] = int32(n(7 + i));
+        for (size_t i = 0; i < OUTFIT_WEAPONS; ++i) o.weapons[i] = uint32(std::max<long>(0, n(7 + OUTFIT_ARMOR + i)));
+        return RaceModel(o) != 0;
+    }
+
+    void LoadOutfits()
+    {
+        WorldDatabase.DirectExecute("CREATE TABLE IF NOT EXISTS coa_npc_outfit (entry INT UNSIGNED NOT NULL PRIMARY KEY, outfit VARCHAR(255) NOT NULL, "
+            "comment VARCHAR(100) NOT NULL DEFAULT '') ENGINE=InnoDB COMMENT='Dev Menu: player-race NPC looks'");
+        WorldDatabase.DirectExecute("ALTER TABLE coa_npc_outfit MODIFY outfit VARCHAR(600) NOT NULL");
+        std::lock_guard<std::mutex> lock(g_outfitLock);
+        g_outfits.clear();
+        if (QueryResult r = WorldDatabase.Query("SELECT entry, outfit FROM coa_npc_outfit"))
+            do
+            {
+                Outfit o;
+                if (UnpackOutfit(r->Fetch()[1].Get<std::string>(), o))
+                    g_outfits[r->Fetch()[0].Get<uint32>()] = o;
+            } while (r->NextRow());
+        LOG_INFO("module", ">> Dev Menu: {} NPC outfits loaded", g_outfits.size());
+    }
+
+    bool FindOutfit(Creature const* c, Outfit& out)
+    {
+        std::lock_guard<std::mutex> lock(g_outfitLock);
+        auto p = g_previews.find(c->GetGUID());
+        if (p != g_previews.end()) { out = p->second; return true; }
+        auto e = g_outfits.find(c->GetEntry());
+        if (e != g_outfits.end()) { out = e->second; return true; }
+        return false;
+    }
+
+    uint32 ArmorDisplay(int32 v)
+    {
+        if (v < 0)
+            return uint32(-v);
+        if (ItemTemplate const* it = v ? sObjectMgr->GetItemTemplate(uint32(v)) : nullptr)
+            return it->DisplayInfoID;
+        return 0;
+    }
+
+    // answer the client's mirror image request for our NPCs (return false = handled)
+    bool AnswerOutfit(WorldSession* session, WorldPacket const& packet)
+    {
+        if (packet.GetOpcode() != CMSG_GET_MIRRORIMAGE_DATA || packet.size() < sizeof(uint64) || !session->GetPlayer())
+            return true;
+        ObjectGuid guid = packet.read<ObjectGuid>(0);
+        if (!guid.IsCreatureOrVehicle())
+            return true;
+        Creature* c = ObjectAccessor::GetCreature(*session->GetPlayer(), guid);
+        Outfit o;
+        if (!c || !FindOutfit(c, o))
+            return true;
+        WorldPacket data(SMSG_MIRRORIMAGE_DATA, 68);
+        data << guid << uint32(RaceModel(o)) << uint8(o.race) << uint8(o.gender) << uint8(1)
+             << uint8(o.skin) << uint8(o.face) << uint8(o.hair) << uint8(o.hairColor) << uint8(o.facial) << uint32(0);
+        for (int32 a : o.armor)
+            data << uint32(ArmorDisplay(a));
+        // extra look bits for custom-race clients ride after the stock fields: "extra" (uint64) + magic 'DMX1'.
+        // Stock clients stop reading after the armor, so the tail is ignored there.
+        if (std::string::size_type at = o.ext.find("extra="); at != std::string::npos)
+            if (uint64 extra = std::strtoull(o.ext.c_str() + at + 6, nullptr, 10))
+                data << extra << uint32(0x31584D44);
+        session->SendPacket(&data);
+        // custom clients: the addon hands these to the client's look adapter (see the Help page)
+        if (!o.ext.empty())
+        {
+            char g[24];
+            std::snprintf(g, sizeof(g), "0x%016llX", (unsigned long long)guid.GetRawValue());
+            Send(session->GetPlayer(), Join("XL", std::string(g), o.ext));
+        }
+        return false;
+    }
+
+    void Dress(Creature* c, Outfit const& o)
+    {
+        c->SetUnitFlag2(UNIT_FLAG2_MIRROR_IMAGE);
+        c->SetDisplayId(RaceModel(o));
+        c->SetNativeDisplayId(RaceModel(o));
+        for (size_t i = 0; i < OUTFIT_WEAPONS; ++i)
+            c->SetVirtualItem(i, o.weapons[i]);
+    }
+
+    // send the look to the client after a change: the client only asks for it when the NPC appears, so re-create it
+    void RefreshLook(Creature* c)
+    {
+        if (c->IsSummon())
+            return;
+        c->DespawnOrUnsummon(0ms, 1s);
+    }
+
+    // OUT~... : player's own look (visible items = transmog included), a spawn's look, the race list
+    void OpOutfitRaces(Player* p)
+    {
+        Send(p, Join("ORB", 0));
+        for (uint32 i = 0; i < sChrRacesStore.GetNumRows(); ++i)
+        {
+            ChrRacesEntry const* r = sChrRacesStore.LookupEntry(i);
+            if (!r || (!r->model_m && !r->model_f))
+                continue;
+            // any locale's name (servers with non-English DBCs), else "Race <id>"
+            std::string name;
+            for (char const* n : r->name)
+                if (n && *n) { name = n; break; }
+            if (name.empty())
+                name = "Race " + std::to_string(i);
+            for (uint8 g = 0; g < 2; ++g)
+            {
+                if (!(g ? r->model_f : r->model_m))
+                    continue;   // male-only / female-only races
+
+                uint32 skins = 0, faces = 0, hairs = 0, colors = 0, facials = 0;
+                for (uint32 k = 0; k < sCharSectionsStore.GetNumRows(); ++k)
+                {
+                    CharSectionsEntry const* s = sCharSectionsStore.LookupEntry(k);
+                    if (!s || s->Race != i || s->Gender != g)
+                        continue;
+                    switch (s->GenType)
+                    {
+                        case 0: skins = std::max(skins, s->Color + 1); break;
+                        case 1: faces = std::max(faces, s->Type + 1); break;
+                        case 2: facials = std::max(facials, s->Type + 1); break;
+                        case 3: hairs = std::max(hairs, s->Type + 1); colors = std::max(colors, s->Color + 1); break;
+                        default: break;
+                    }
+                }
+                Send(p, Join("OR", i, Clean(name, 40), uint32(g), g ? r->model_f : r->model_m, skins, faces, hairs, colors, facials));
+            }
+        }
+        Send(p, Join("ORE", 0));
+    }
+
+    void OpOutfitMine(Player* p)
+    {
+        Outfit o;
+        o.race = p->getRace(); o.gender = p->getGender();
+        o.skin = p->GetByteValue(PLAYER_BYTES, 0); o.face = p->GetByteValue(PLAYER_BYTES, 1); o.hair = p->GetByteValue(PLAYER_BYTES, 2);
+        o.hairColor = p->GetByteValue(PLAYER_BYTES, 3); o.facial = p->GetByteValue(PLAYER_BYTES_2, 0);
+        for (size_t i = 0; i < OUTFIT_ARMOR; ++i)
+            o.armor[i] = int32(p->GetUInt32Value(PLAYER_VISIBLE_ITEM_1_ENTRYID + ARMOR_SLOTS[i] * 2));
+        for (size_t i = 0; i < OUTFIT_WEAPONS; ++i)
+            o.weapons[i] = p->GetUInt32Value(PLAYER_VISIBLE_ITEM_1_ENTRYID + WEAPON_SLOTS[i] * 2);
+        if (p->HasPlayerFlag(PLAYER_FLAGS_HIDE_HELM)) o.armor[0] = 0;
+        if (p->HasPlayerFlag(PLAYER_FLAGS_HIDE_CLOAK)) o.armor[9] = 0;
+        Send(p, Join("OL", PackOutfit(o), "Your look"));
+    }
+
+    void OpOutfitGet(Player* p, std::vector<std::string> const& a)
+    {
+        Creature* c = FindSpawn(p, U(a, 2));
+        if (!c)
+            return Err(p, "Select an NPC first");
+        Outfit o;
+        if (FindOutfit(c, o))
+            return Send(p, Join("OL", PackOutfit(o), Clean(c->GetName(), 40)));
+        Err(p, "This NPC has no outfit yet (it uses a normal creature model)");
+    }
+
+    // a template that already carries the mirror-image flag, so a fresh preview is created with it
+    uint32 PreviewEntry()
+    {
+        static uint32 entry = 0;
+        if (entry && sObjectMgr->GetCreatureTemplate(entry))
+            return entry;
+        if (QueryResult r = WorldDatabase.Query("SELECT entry FROM creature_template WHERE name = 'Dev outfit preview' AND entry BETWEEN {} AND {} LIMIT 1", CLONE_FIRST, CLONE_LAST))
+            entry = r->Fetch()[0].Get<uint32>();
+        if (!entry || !sObjectMgr->GetCreatureTemplate(entry))
+        {
+            entry = CloneTemplate(OUTFIT_BASE_ENTRY);
+            if (!entry)
+                return 0;
+            WorldDatabase.DirectExecute("UPDATE creature_template SET name = 'Dev outfit preview', subname = '', npcflag = 0, faction = 35, ScriptName = '', AIName = '', unit_flags2 = unit_flags2 | {} WHERE entry = {}", uint32(UNIT_FLAG2_MIRROR_IMAGE), entry);
+        }
+        CreatureTemplate* ct = MutableTemplate(entry);
+        ct->Name = "Preview"; ct->npcflag = 0; ct->faction = 35; ct->ScriptID = 0; ct->AIName = "";
+        ct->unit_flags2 |= UNIT_FLAG2_MIRROR_IMAGE;
+        ct->InitializeQueryData();
+        return entry;
+    }
+
+    void OpPreviewRemove(Player* p)
+    {
+        std::lock_guard<std::mutex> lock(g_outfitLock);
+        auto itr = g_previewOf.find(p->GetGUID().GetCounter());
+        if (itr == g_previewOf.end())
+            return Err(p, "No preview to remove");
+        if (Creature* old = ObjectAccessor::GetCreature(*p, itr->second))
+            old->DespawnOrUnsummon();
+        g_previews.erase(itr->second);
+        g_previewOf.erase(itr);
+        Ok(p, "Preview removed");
+    }
+
+    // OPREV~packed : (re)spawn a preview copy 3 yards in front of you, kept 2 minutes
+    void OpOutfitPreview(Player* p, std::vector<std::string> const& a)
+    {
+        Outfit o;
+        if (!UnpackOutfit(S(a, 2), o))
+            return Err(p, "Unknown race for this client/server");
+        ObjectGuid::LowType me = p->GetGUID().GetCounter();
+        {
+            std::lock_guard<std::mutex> lock(g_outfitLock);
+            auto itr = g_previewOf.find(me);
+            if (itr != g_previewOf.end())
+            {
+                if (Creature* old = ObjectAccessor::GetCreature(*p, itr->second))
+                    old->DespawnOrUnsummon();
+                g_previews.erase(itr->second);
+                g_previewOf.erase(itr);
+            }
+        }
+        float o2 = p->GetOrientation();
+        float x = p->GetPositionX() + std::cos(o2) * 3.f, y = p->GetPositionY() + std::sin(o2) * 3.f;
+        uint32 pe = PreviewEntry();
+        if (!pe)
+            return Err(p, "Could not create the preview NPC type");
+        TempSummon* c = p->SummonCreature(pe, x, y, p->GetPositionZ(), Position::NormalizeOrientation(o2 + float(M_PI)), TEMPSUMMON_TIMED_DESPAWN, 120000);
+        if (!c)
+            return Err(p, "Could not place the preview here");
+        {
+            std::lock_guard<std::mutex> lock(g_outfitLock);
+            g_previews[c->GetGUID()] = o;
+            g_previewOf[me] = c->GetGUID();
+        }
+        c->SetReactState(REACT_PASSIVE);
+        c->SetFaction(35);
+        c->SetUnitFlag(UNIT_FLAG_NON_ATTACKABLE);
+        c->SetName("Preview");
+        Dress(c, o);
+    }
+
+    // OSAVE~guid~packed~name : guid 0 = create a brand new NPC at your feet; otherwise dress that NPC's type
+    void OpOutfitSave(Player* p, std::vector<std::string> const& a)
+    {
+        Outfit o;
+        if (!UnpackOutfit(S(a, 3), o))
+            return Err(p, "Unknown race for this client/server");
+        Creature* c = U(a, 2) ? FindSpawn(p, U(a, 2)) : nullptr;
+        uint32 entry;
+        if (c)
+        {
+            if (CountSpawnsOfEntry(c->GetEntry()) > 1 || c->GetEntry() < CLONE_FIRST)
+                if (!(c = MakeUnique(p, c)))
+                    return;
+            entry = c->GetEntry();
+        }
+        else
+        {
+            entry = CloneTemplate(OUTFIT_BASE_ENTRY);
+            if (!entry)
+                return Err(p, "Could not create a new NPC type (dev entry range full?)");
+            std::string name = S(a, 4).empty() ? "New NPC" : S(a, 4);
+            CreatureTemplate* ct = MutableTemplate(entry);
+            ct->Name = name; ct->SubName = ""; ct->npcflag = 0; ct->faction = 35; ct->ScriptID = 0; ct->AIName = "";
+            WorldDatabase.DirectExecute("UPDATE creature_template SET name = '{}', subname = '', npcflag = 0, faction = 35, ScriptName = '', AIName = '' WHERE entry = {}", Esc(name), entry);
+        }
+        uint32 model = RaceModel(o);
+        CreatureTemplate* ct = MutableTemplate(entry);
+        ct->unit_flags2 |= UNIT_FLAG2_MIRROR_IMAGE;
+        ct->Models.clear();
+        ct->Models.emplace_back(model, 1.f, 1.f);
+        WorldDatabase.DirectExecute("UPDATE creature_template SET unit_flags2 = unit_flags2 | {} WHERE entry = {}", uint32(UNIT_FLAG2_MIRROR_IMAGE), entry);
+        WorldDatabase.DirectExecute("DELETE FROM creature_template_model WHERE CreatureID = {}", entry);
+        WorldDatabase.DirectExecute("INSERT INTO creature_template_model (CreatureID, Idx, CreatureDisplayID, DisplayScale, Probability) VALUES ({}, 0, {}, 1, 1)", entry, model);
+        WorldDatabase.DirectExecute("REPLACE INTO creature_equip_template (CreatureID, ID, ItemID1, ItemID2, ItemID3) VALUES ({}, 1, {}, {}, {})", entry, o.weapons[0], o.weapons[1], o.weapons[2]);
+        WorldDatabase.DirectExecute("REPLACE INTO coa_npc_outfit (entry, outfit, comment) VALUES ({}, '{}', '{}')", entry, PackOutfit(o), Esc(Clean(ct->Name, 90)));
+        sObjectMgr->LoadEquipmentTemplates();
+        ct->InitializeQueryData();
+        SendQuery(p, ct);
+        {
+            std::lock_guard<std::mutex> lock(g_outfitLock);
+            g_outfits[entry] = o;
+        }
+        if (!c)
+        {
+            std::vector<std::string> b = { "Q", "SPAWN", std::to_string(entry), "1" };
+            OpSpawn(p, b);
+            return Ok(p, "New NPC created and placed. Rename it in Identity");
+        }
+        c->SetCurrentEquipmentId(1);
+        Dress(c, o);
+        Ok(p, "Outfit saved");
+        SendInfo(p, c);
+        RefreshLook(c);
+    }
+
+    // ---- wardrobe "disguise": the client can only draw a textured, dressable model of the player in menus,
+    // so while the wardrobe is open the GM is shown with the NPC's race and look (never saved: restored before any save)
+    struct RealLook { uint8 race, gender, facial, gender3; uint32 bytes, display, native; };
+    std::unordered_map<ObjectGuid::LowType, RealLook> g_disguised;
+    std::mutex g_disguiseLock;   // autosave runs in map threads, the menu in the world thread
+
+    bool Undisguise(Player* p)
+    {
+        std::lock_guard<std::mutex> lock(g_disguiseLock);
+        auto itr = g_disguised.find(p->GetGUID().GetCounter());
+        if (itr == g_disguised.end())
+            return false;
+        RealLook const& r = itr->second;
+        p->SetByteValue(UNIT_FIELD_BYTES_0, 0, r.race);
+        p->SetByteValue(UNIT_FIELD_BYTES_0, 2, r.gender);
+        p->SetUInt32Value(PLAYER_BYTES, r.bytes);
+        p->SetByteValue(PLAYER_BYTES_2, 0, r.facial);
+        p->SetByteValue(PLAYER_BYTES_3, 0, r.gender3);
+        p->SetNativeDisplayId(r.native);
+        p->SetDisplayId(r.display);
+        g_disguised.erase(itr);
+        return true;
+    }
+
+    void OpDisguise(Player* p, std::vector<std::string> const& a)
+    {
+        Outfit o;
+        if (!UnpackOutfit(S(a, 2), o))
+            return Err(p, "Unknown race");
+        std::lock_guard<std::mutex> lock(g_disguiseLock);
+        if (p->GetDisplayId() != p->GetNativeDisplayId() && !g_disguised.count(p->GetGUID().GetCounter()))
+            return Err(p, "Leave your shapeshift or morph first");
+        if (!g_disguised.count(p->GetGUID().GetCounter()))
+            g_disguised[p->GetGUID().GetCounter()] = { p->getRace(), p->getGender(), p->GetByteValue(PLAYER_BYTES_2, 0), p->GetByteValue(PLAYER_BYTES_3, 0),
+                p->GetUInt32Value(PLAYER_BYTES), p->GetDisplayId(), p->GetNativeDisplayId() };
+        p->SetByteValue(UNIT_FIELD_BYTES_0, 0, o.race);
+        p->SetByteValue(UNIT_FIELD_BYTES_0, 2, o.gender);
+        p->SetUInt32Value(PLAYER_BYTES, uint32(o.skin) | (uint32(o.face) << 8) | (uint32(o.hair) << 16) | (uint32(o.hairColor) << 24));
+        p->SetByteValue(PLAYER_BYTES_2, 0, o.facial);
+        p->SetByteValue(PLAYER_BYTES_3, 0, o.gender);
+        p->SetNativeDisplayId(RaceModel(o));
+        p->SetDisplayId(RaceModel(o));
+        Send(p, Join("DG", 1));
+    }
+
+    // ISEARCH~text~slot~page : items that fit an outfit slot (slot index as in the outfit, 11-13 = weapons)
+    void OpItemSearch(Player* p, std::vector<std::string> const& a)
+    {
+        static std::vector<std::set<uint32>> const types = {
+            { 1 }, { 3 }, { 4 }, { 5, 20 }, { 6 }, { 7 }, { 8 }, { 9 }, { 10 }, { 16 }, { 19 },
+            { 13, 17, 21 }, { 13, 14, 22, 23 }, { 15, 25, 26 },
+        };
+        std::string q = Lower(S(a, 2));
+        uint32 slot = std::min<uint32>(U(a, 3), uint32(types.size() - 1));
+        uint32 page = U(a, 4);
+        int32 sub = S(a, 5).empty() ? -1 : int32(std::strtol(S(a, 5).c_str(), nullptr, 10));   // armor material / weapon type, -1 any
+        uint32 sortBy = U(a, 6);              // 0 name, 1 quality (best first), 2 item level
+        bool availOnly = U(a, 7) != 0;        // only items whose model exists in the game data
+        uint32 qid = uint32(std::strtoul(q.c_str(), nullptr, 10));
+        std::vector<ItemTemplate const*> hits;
+        for (auto const& [id, it] : *sObjectMgr->GetItemTemplateStore())
+        {
+            if (!types[slot].count(it.InventoryType) || !it.DisplayInfoID)
+                continue;
+            if (!q.empty() && id != qid && Lower(it.Name1).find(q) == std::string::npos)
+                continue;
+            if (sub >= 0)
+            {
+                // weapons: 100 + weapon subclass; shields / held in off-hand use armor subclass 6 / InventoryType 23
+                if (sub >= 100) { if (it.Class != ITEM_CLASS_WEAPON || int32(it.SubClass) != sub - 100) continue; }
+                else if (sub == 99) { if (it.InventoryType != INVTYPE_HOLDABLE) continue; }
+                else if (it.Class != ITEM_CLASS_ARMOR || int32(it.SubClass) != sub) continue;
+            }
+            if (availOnly && !sItemDisplayInfoStore.LookupEntry(it.DisplayInfoID))
+                continue;
+            hits.push_back(&it);
+        }
+        std::sort(hits.begin(), hits.end(), [&](ItemTemplate const* x, ItemTemplate const* y)
+        {
+            if ((x->ItemId == qid) != (y->ItemId == qid)) return x->ItemId == qid;
+            if (sortBy == 1 && x->Quality != y->Quality) return x->Quality > y->Quality;
+            if (sortBy == 2 && x->ItemLevel != y->ItemLevel) return x->ItemLevel > y->ItemLevel;
+            return x->Name1 != y->Name1 ? x->Name1 < y->Name1 : x->ItemId < y->ItemId;
+        });
+        uint32 total = uint32(hits.size());
+        uint32 pages = std::max<uint32>(1, (total + PAGE_SIZE - 1) / PAGE_SIZE);
+        page = std::min(page, pages - 1);
+        Send(p, Join("IB", total, page, pages));
+        for (uint32 i = page * PAGE_SIZE; i < std::min(total, (page + 1) * PAGE_SIZE); ++i)
+            Send(p, Join("IR", hits[i]->ItemId, Clean(hits[i]->Name1, 60), hits[i]->Quality, hits[i]->DisplayInfoID, hits[i]->InventoryType));
+        Send(p, Join("IE", total, page, pages));
+    }
+
+    void Dispatch(Player* p, std::string const& payload)
+    {
+        std::vector<std::string> a = Split(payload, '~');
+        if (a.size() < 2 || a[0] != "Q")
+            return;
+        std::string const& op = a[1];
+
+        if (!sConfigMgr->GetOption<bool>("DevMenu.Enable", true))
+            return Err(p, "Dev menu is disabled on this server (DevMenu.Enable)");
+        if (uint32(p->GetSession()->GetSecurity()) < sConfigMgr->GetOption<uint32>("DevMenu.MinSecurity", SEC_GAMEMASTER))
+            return Err(p, "Dev menu needs a GM account");
+
+        if (op == "HELLO") return Send(p, Join("HI", uint32(p->GetSession()->GetSecurity())));
+        if (op == "SEARCH") return OpSearch(p, a);
+        if (op == "SPAWN") return OpSpawn(p, a);
+        if (op == "DUP") return OpDuplicate(p, a);
+        if (op == "RENAMET") return OpRenameType(p, a);
+        if (op == "NEAR") return OpNear(p, a);
+        if (op == "PADD") return OpPathAdd(p);
+        if (op == "PUNDO") return OpPathUndo(p);
+        if (op == "PCLEAR") return OpPathClear(p);
+        if (op == "PCLICK") return OpPathClickMode(p, a);
+        if (op == "PADDAT") return OpPathAddAt(p, a);
+        if (op == "PLIST") return SendPathList(p, g_state[p->GetGUID().GetCounter()].path);
+        if (op == "BUF") { g_buf[p->GetGUID().GetCounter()] += S(a, 2); return; }
+        if (op == "BUFC") { g_buf[p->GetGUID().GetCounter()].clear(); return; }
+        if (op == "RGET") return OpRGet(p, a);
+        if (op == "RSET") return OpRSet(p, a);
+        if (op == "RLOAD") return ReloadTables(p);
+        if (op == "LGET") return OpLGet(p, a);
+        if (op == "LADD") return OpLRow(p, a, true);
+        if (op == "LDEL") return OpLRow(p, a, false);
+        if (op == "NEWID") return OpNewId(p, a);
+        if (op == "QSEARCH") return OpQSearch(p, a);
+        if (op == "QNEW") return OpQNew(p, a);
+        if (op == "QDEL") return OpQDel(p, a);
+        if (op == "QESCORT") return OpQEscort(p, a);
+        if (op == "GSEARCH") return OpGSearch(p, a);
+        if (op == "ORACES") return OpOutfitRaces(p);
+        if (op == "ISEARCH") return OpItemSearch(p, a);
+        if (op == "DISGUISE") return OpDisguise(p, a);
+        if (op == "UNDISGUISE") { Undisguise(p); return Send(p, Join("DG", 0)); }
+        if (op == "OMINE") return OpOutfitMine(p);
+        if (op == "OGET") return OpOutfitGet(p, a);
+        if (op == "OPREV") return OpOutfitPreview(p, a);
+        if (op == "OPREVDEL") return OpPreviewRemove(p);
+        if (op == "OSAVE") return OpOutfitSave(p, a);
+        if (op == "XCSEARCH") return OpExtCostSearch(p, a);
+        if (op == "IPRICE") return OpItemPrice(p, a);
+        if (op == "VCUR") return OpVendorCurrency(p, a);
+        if (op == "SPSEARCH") return OpSpellSearch(p, a);
+        if (op == "GSPAWN") return OpGSpawn(p, a);
+        if (op == "GNEAR") return OpGNear(p, a);
+        static std::set<std::string> const goOps = { "GTGT", "GPICK", "GSEL", "GMOVE", "GNUDGE", "GNUDGEW", "GROT", "GFACE", "GGOTO", "GDEL", "GDUP" };
+        if (goOps.count(op)) return GoOps(p, op, a);
+
+        Creature* c = Target(p, a);
+        if (!c)
+            return;
+        if (op == "SEL") return SendInfo(p, c);
+        if (op == "TGET") return SendAdvanced(p, c);
+        if (op == "TSET") return OpTSet(p, c, a);
+        if (op == "CGET") return SendCombat(p, c);
+        if (op == "CADD") return OpCombatAdd(p, c, a);
+        if (op == "CDEL") return OpCombatDel(p, c, a);
+        if (op == "REP") return OpRep(p, c, a);
+        if (op == "MOVE") return OpMoveHere(p, c);
+        if (op == "NUDGE") return OpNudge(p, c, a);
+        if (op == "FACE") return OpFace(p, c);
+        if (op == "NUDGEW") return OpNudgeW(p, c, a);
+        if (op == "SETO") return OpSetO(p, c, a);
+        if (op == "DEL") return OpDelete(p, c);
+        if (op == "MOVETYPE") return OpMoveType(p, c, a);
+        if (op == "EMOTE") return OpEmote(p, c, a);
+        if (op == "PLAY") return OpPlay(p, c, a);
+        if (op == "ROLE") return OpRole(p, c, a);
+        if (op == "GUARD") return OpGuard(p, c, a);
+        if (op == "FACTION") return OpFaction(p, c, a);
+        if (op == "RENAME") return OpRename(p, c, a);
+        if (op == "LEVEL") return OpLevel(p, c, a);
+        if (op == "MODEL") return OpModel(p, c, a);
+        if (op == "ENTRY") return OpEntry(p, c, a);
+        if (op == "UNIQUE") return OpUnique(p, c);
+        if (op == "VENDORADD") return OpVendorAdd(p, c, a);
+        if (op == "RESPAWN") return OpRespawn(p, c);
+        if (op == "GOTO") return OpGoto(p, c);
+        if (op == "PSHOW") return OpPathLoad(p, c, false);
+        if (op == "PEDIT") return OpPathLoad(p, c, true);
+        if (op == "PSAVE") return OpPathSave(p, c, a);
+        if (op == "PDEL") return OpPathDelete(p, c);
+        Err(p, "Unknown op " + Clean(op, 20));
+    }
+}
+
+class CoADevMenuPlayerScript : public PlayerScript
+{
+public:
+    CoADevMenuPlayerScript() : PlayerScript("CoADevMenuPlayerScript", { PLAYERHOOK_ON_BEFORE_SEND_CHAT_MESSAGE, PLAYERHOOK_ON_LOGOUT,
+        PLAYERHOOK_ON_SAVE, PLAYERHOOK_ON_BEFORE_LOGOUT }) { }
+
+    // never let a wardrobe disguise reach the database
+    void OnPlayerSave(Player* player) override { if (Undisguise(player)) Send(player, Join("DG", 0)); }
+    void OnPlayerBeforeLogout(Player* player) override { Undisguise(player); }
+
+    void OnPlayerBeforeSendChatMessage(Player* player, uint32& type, uint32& lang, std::string& msg) override
+    {
+        if (!player || type != CHAT_MSG_WHISPER || lang != LANG_ADDON)
+            return;
+        std::string const pfx = std::string(PREFIX) + "\t";
+        if (msg.compare(0, pfx.size(), pfx) != 0)
+            return;
+        std::string payload = msg.substr(pfx.size());
+        if (payload.compare(0, 2, "Q~") != 0)
+            return;   // our own replies echoing back
+        // chat runs inside the (multi-threaded) map update; edits touch shared stores, so run them on the world thread
+        std::lock_guard<std::mutex> lock(g_queueLock);
+        g_queue.emplace_back(player->GetGUID(), payload);
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        Undisguise(player);
+        auto itr = g_state.find(player->GetGUID().GetCounter());
+        if (itr == g_state.end())
+            return;
+        ClearMarkers(player, itr->second);
+        g_state.erase(itr);
+    }
+};
+
+class CoADevMenuServerScript : public ServerScript
+{
+public:
+    CoADevMenuServerScript() : ServerScript("CoADevMenuServerScript", { SERVERHOOK_CAN_PACKET_RECEIVE }) { }
+
+    bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
+    {
+        return !session || (AnswerOutfit(session, packet) && AnswerPathClick(session, packet));
+    }
+};
+
+class CoADevMenuWorldScript : public WorldScript
+{
+public:
+    CoADevMenuWorldScript() : WorldScript("CoADevMenuWorldScript", { WORLDHOOK_ON_STARTUP, WORLDHOOK_ON_UPDATE }) { }
+
+    void OnStartup() override { LoadOutfits(); }
+
+    // between map updates: safe to change templates, reload quests/vendors/gossip, spawn and move things
+    void OnUpdate(uint32 /*diff*/) override
+    {
+        std::vector<std::pair<ObjectGuid, std::string>> work;
+        {
+            std::lock_guard<std::mutex> lock(g_queueLock);
+            work.swap(g_queue);
+        }
+        for (auto const& [guid, payload] : work)
+        {
+            Player* player = ObjectAccessor::FindPlayer(guid);
+            if (!player || !player->IsInWorld())
+                continue;
+            try
+            {
+                Dispatch(player, payload);
+            }
+            catch (std::exception const& e)
+            {
+                LOG_ERROR("module", "Dev menu: {} failed: {}", payload, e.what());
+                Err(player, "Server error, see worldserver log");
+            }
+        }
+    }
+};
+
+void AddSC_ilusixn_devmenu()
+{
+    new CoADevMenuPlayerScript();
+    new CoADevMenuServerScript();
+    new CoADevMenuWorldScript();
+}

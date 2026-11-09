@@ -1,0 +1,20 @@
+[worldserver]
+
+###################################################################################################
+# DEV MENU (in-game NPC editor, client addon DevMenu, /dev)
+#
+#    DevMenu.Enable
+#        Description: Answer the addon's requests.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+DevMenu.Enable = 1
+
+#    DevMenu.MinSecurity
+#        Description: Lowest account security level allowed to use the menu.
+#        Default:     2 - (Game master)
+#                     3 - (Administrator)
+
+DevMenu.MinSecurity = 2
+
+###################################################################################################
